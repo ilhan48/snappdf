@@ -43,6 +43,10 @@ struct Args {
     #[arg(long, default_value = "light", value_parser = parse_theme)]
     theme: pdf::Theme,
 
+    /// Gövde yazı tipi büyüklüğü, pt (8-16; tablet+kalem okuma için 12 önerilir)
+    #[arg(long, default_value_t = 11, value_parser = parse_font_size)]
+    font_size: u8,
+
     /// PDF yazar alanı (varsayılan: sayfanın alan adı)
     #[arg(long)]
     author: Option<String>,
@@ -78,6 +82,15 @@ fn parse_page_size(value: &str) -> Result<pdf::PageSize, String> {
 fn parse_theme(value: &str) -> Result<pdf::Theme, String> {
     pdf::Theme::parse(value)
         .ok_or_else(|| format!("bilinmeyen tema '{value}' (light, dark, sepia)"))
+}
+
+/// `--font-size` değerini çözer (8-16 pt).
+fn parse_font_size(value: &str) -> Result<u8, String> {
+    value
+        .parse::<u8>()
+        .ok()
+        .filter(|n| (8..=16).contains(n))
+        .ok_or_else(|| format!("bilinmeyen yazı boyutu '{value}' (8-16 pt)"))
 }
 
 #[tokio::main]
@@ -174,7 +187,7 @@ async fn render_url(
 
     let opts = pdf::PdfOptions {
         footer: !args.no_footer,
-        font_size: 11,
+        font_size: args.font_size,
         embed_images: !args.no_images,
         page: args.page_size,
         theme: args.theme,
@@ -234,6 +247,7 @@ mod tests {
             no_images: false,
             page_size: pdf::PageSize::A4,
             theme: pdf::Theme::Light,
+            font_size: 11,
             author: None,
             lang: "tr".to_string(),
             no_bookmarks: false,
@@ -261,16 +275,17 @@ mod tests {
         assert!(o.embed_images);
         a.no_footer = true;
         a.no_images = true;
+        a.font_size = 12;
         let o = pdf_options_from(&a);
         assert!(!o.footer);
         assert!(!o.embed_images);
-        assert_eq!(o.font_size, 11);
+        assert_eq!(o.font_size, 12);
     }
 
     fn pdf_options_from(args: &Args) -> pdf::PdfOptions {
         pdf::PdfOptions {
             footer: !args.no_footer,
-            font_size: 11,
+            font_size: args.font_size,
             embed_images: !args.no_images,
             page: args.page_size,
             theme: args.theme,
@@ -292,12 +307,15 @@ mod tests {
             "--lang",
             "en",
             "--no-bookmarks",
+            "--font-size",
+            "12",
         ]);
         assert_eq!(a.page_size, pdf::PageSize::A5);
         assert_eq!(a.theme, pdf::Theme::Dark);
         assert_eq!(a.author.as_deref(), Some("Gencay"));
         assert_eq!(a.lang, "en");
         assert!(a.no_bookmarks);
+        assert_eq!(a.font_size, 12);
     }
 
     #[test]
@@ -308,14 +326,20 @@ mod tests {
         assert!(!a.no_bookmarks);
         assert_eq!(a.lang, "tr");
         assert!(a.author.is_none());
+        assert_eq!(a.font_size, 11);
     }
 
     #[test]
     fn clap_rejects_unknown_page_size_and_theme() {
         assert!(Args::try_parse_from(["snappdf", "https://a.com", "--page-size", "a6"]).is_err());
         assert!(Args::try_parse_from(["snappdf", "https://a.com", "--theme", "neon"]).is_err());
+        assert!(Args::try_parse_from(["snappdf", "https://a.com", "--font-size", "7"]).is_err());
+        assert!(Args::try_parse_from(["snappdf", "https://a.com", "--font-size", "17"]).is_err());
+        assert!(Args::try_parse_from(["snappdf", "https://a.com", "--font-size", "abc"]).is_err());
+        assert!(Args::try_parse_from(["snappdf", "https://a.com", "--font-size", "12"]).is_ok());
         assert!(parse_page_size("A5").is_ok());
         assert!(parse_theme("Sepia").is_ok());
+        assert!(parse_font_size("8").is_ok());
     }
 
     // --- clap tanımlarının parse düzeyi testleri ---

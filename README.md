@@ -113,12 +113,15 @@ snappdf --refresh-filters      # filtre listelerini yeniden indir
 # Okuma deneyimi
 snappdf <url> --page-size a5       # a4 | a5 | letter | tablet (162x216 mm)
 snappdf <url> --theme dark         # light | dark | sepia
+snappdf <url> --font-size 12       # gövde yazısı, pt (8-16, varsayılan: 11)
 snappdf <url> --author "Gencay"    # /Author (varsayılan: alan adı)
 snappdf <url> --lang en            # /Lang etiketi (varsayılan: tr)
 ```
 
-Tablet için önerilen: `--page-size a5 --theme sepia` — 11 puntoda ~55 karakter
-satır, tam ekranda okunur.
+Tablet + kalemle çalışmak için önerilen: `--page-size tablet --theme sepia --font-size 12`
+— 4:3 tablet ekranını doldurur, 12 puntoda ~55 karakter satır, kenar boşlukları
+nota yer bırakır. Başlıklar yer imi ağacına işlenir, kod blokları çevrilmez
+bırakılır; uzun yazılarda bile kaybolmazsın.
 
 Çıktı dosyası adı host'tan türetilir: `developer.mozilla.org.pdf`,
 `www.rust-lang.org.pdf` ...
