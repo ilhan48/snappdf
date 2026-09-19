@@ -131,18 +131,38 @@ pub async fn fetch_image(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_default();
-    let format = if ctype.contains("png") {
-        "png"
-    } else if ctype.contains("jpeg") || ctype.contains("jpg") {
-        "jpeg"
-    } else {
-        return None; // gif/webp/svg ve bilinmeyenler PDF'e gömülmez
-    };
     let data = resp.bytes().await.ok()?;
     if data.is_empty() {
         return None;
     }
+    // Önce içerik-tipi, tanınmıyorsa sihirli baytlar (bazı sunucular
+    // application/octet-stream döndürür). gif/svg PDF'e gömülmez.
+    let by_ctype = if ctype.contains("png") {
+        Some("png")
+    } else if ctype.contains("jpeg") || ctype.contains("jpg") {
+        Some("jpeg")
+    } else if ctype.contains("webp") {
+        Some("webp")
+    } else {
+        None
+    };
+    let format = by_ctype.or_else(|| sniff_image_format(&data))?;
     Some((data, format))
+}
+
+/// İçerik-tipi güvenilmezse sihirli baytlardan biçim çıkarır.
+pub fn sniff_image_format(data: &[u8]) -> Option<&'static str> {
+    if data.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some("png");
+    }
+    if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("jpeg");
+    }
+    // RIFF....WEBP
+    if data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        return Some("webp");
+    }
+    None
 }
 
 /// Mutlak URL üretir: baz URL'ye göre çözer; zaten mutlaksa olduğu gibi döner.
@@ -356,8 +376,10 @@ mod tests {
             if path.contains("resim.png") {
                 // İçerik-tipi başlığı + gövde; TestServer protokolü: CTYPE:<ct>|NEXT|<gövde>
                 format!("CTYPE: image/png|NEXT|{}", String::from_utf8_lossy(png1x1))
+            } else if path.contains("foto.webp") {
+                "CTYPE: image/webp|NEXT|RIFF....WEBP".to_string()
             } else {
-                "CTYPE: image/webp|NEXT|xx".to_string()
+                "CTYPE: image/svg+xml|NEXT|<svg/>".to_string()
             }
         });
         let client = build_client(DEFAULT_TIMEOUT).unwrap();
@@ -365,7 +387,23 @@ mod tests {
         assert!(got.is_some());
         assert_eq!(got.unwrap().1, "png");
 
-        let rejected = fetch_image(&client, &server.url("diger.webp")).await;
+        // WebP artık kabul edilir (kayıpsız/alfalı WebP'ler yaygın).
+        let webp = fetch_image(&client, &server.url("foto.webp")).await;
+        assert_eq!(webp.unwrap().1, "webp");
+
+        // SVG hâlâ reddedilir (tarayıcısız rasterleştirme yok).
+        let rejected = fetch_image(&client, &server.url("vektor.svg")).await;
         assert!(rejected.is_none());
+    }
+
+    #[test]
+    fn sniffs_webp_from_magic_bytes() {
+        let mut data = b"RIFF".to_vec();
+        data.extend_from_slice(&[0x24, 0x00, 0x00, 0x00]);
+        data.extend_from_slice(b"WEBPVP8L");
+        assert_eq!(sniff_image_format(&data), Some("webp"));
+        // Eksik/sahte başlıklar WebP sayılmaz.
+        assert_eq!(sniff_image_format(b"RIFF"), None);
+        assert_eq!(sniff_image_format(b"RIFF____XXXX"), None);
     }
 }

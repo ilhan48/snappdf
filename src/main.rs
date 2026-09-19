@@ -1,10 +1,12 @@
 mod blocker;
 mod extract;
 mod fetch;
+mod fonts;
 mod images;
 mod install;
 mod lists;
 mod pdf;
+mod postprocess;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -33,6 +35,26 @@ struct Args {
     #[arg(long, default_value_t = false)]
     no_images: bool,
 
+    /// Sayfa boyutu: a4 | a5 | letter | tablet
+    #[arg(long, default_value = "a4", value_parser = parse_page_size)]
+    page_size: pdf::PageSize,
+
+    /// Okuma teması: light | dark | sepia
+    #[arg(long, default_value = "light", value_parser = parse_theme)]
+    theme: pdf::Theme,
+
+    /// PDF yazar alanı (varsayılan: sayfanın alan adı)
+    #[arg(long)]
+    author: Option<String>,
+
+    /// İçerik dili etiketi (PDF /Lang)
+    #[arg(long, default_value = "tr")]
+    lang: String,
+
+    /// Başlıklardan PDF yer imi (içindekiler) üretme
+    #[arg(long, default_value_t = false)]
+    no_bookmarks: bool,
+
     /// Filtre listelerini yeniden indir
     #[arg(long, default_value_t = false)]
     refresh_filters: bool,
@@ -44,6 +66,18 @@ struct Args {
     /// Kurulumu ve bağımlılıkları teşhis et
     #[arg(long, default_value_t = false)]
     doctor: bool,
+}
+
+/// `--page-size` değerini çözer.
+fn parse_page_size(value: &str) -> Result<pdf::PageSize, String> {
+    pdf::PageSize::parse(value)
+        .ok_or_else(|| format!("bilinmeyen sayfa boyutu '{value}' (a4, a5, letter, tablet)"))
+}
+
+/// `--theme` değerini çözer.
+fn parse_theme(value: &str) -> Result<pdf::Theme, String> {
+    pdf::Theme::parse(value)
+        .ok_or_else(|| format!("bilinmeyen tema '{value}' (light, dark, sepia)"))
 }
 
 #[tokio::main]
@@ -121,30 +155,69 @@ async fn render_url(
     let mut article = extract::extract(&html, url, &extract::ExtractOptions::default())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // Reklam/izleyici görselleri adblock motoruyla süzülür.
-    let before = article.images.len();
-    article
+    // Reklam/izleyici görselleri adblock motoruyla süzülür. Hem görsel
+    // listesinden hem de bloklardan çıkarılır; aksi halde engellenen görsel
+    // PDF'e yine girerdi.
+    let blocked: Vec<String> = article
         .images
-        .retain(|img| !blocker.should_block(img, url, "image"));
-    let dropped = before - article.images.len();
-    if dropped > 0 {
-        eprintln!("[temiz] {dropped} izleyici/reklam görseli elendi");
+        .iter()
+        .filter(|img| blocker.should_block(img, url, "image"))
+        .cloned()
+        .collect();
+    if !blocked.is_empty() {
+        article.images.retain(|img| !blocked.contains(img));
+        article
+            .blocks
+            .retain(|b| !matches!(b, extract::Block::Image(u) if blocked.contains(u)));
+        eprintln!("[temiz] {} izleyici/reklam görseli elendi", blocked.len());
     }
 
     let opts = pdf::PdfOptions {
         footer: !args.no_footer,
         font_size: 11,
         embed_images: !args.no_images,
+        page: args.page_size,
+        theme: args.theme,
+        bookmarks: !args.no_bookmarks,
     };
+    let meta = postprocess::Meta {
+        title: article.title.clone(),
+        author: args.author.clone().unwrap_or_else(|| pdf::host(url)),
+        language: args.lang.clone(),
+    };
+    let tables = article
+        .blocks
+        .iter()
+        .filter(|b| matches!(b, extract::Block::Table(_)))
+        .count();
     eprintln!(
-        "[pdf] belge kuruluyor ({} blok, {} görsel)...",
+        "[pdf] {} sayfası, {} tema, {} blok, {tables} tablo, {} görsel...",
+        opts.page.name(),
+        opts.theme.name(),
         article.blocks.len(),
         article.images.len()
     );
 
-    let doc = pdf::build_document(&article, &opts)?;
-    let bytes = pdf::render_to_bytes(doc)?;
-    Ok(bytes)
+    let rendered = pdf::render_article(&article, &opts, &meta)?;
+
+    if !args.no_images {
+        let stats = images::take_stats();
+        eprintln!(
+            "[görsel] {} gömüldü, {} dekoratif atlandı, {} yüklenemedi",
+            stats.loaded, stats.skipped, stats.failed
+        );
+    }
+    eprintln!(
+        "[meta] {} yer imi, dil {}{}",
+        rendered.bookmarks,
+        meta.language,
+        if meta.author.is_empty() {
+            String::new()
+        } else {
+            format!(", yazar {}", meta.author)
+        }
+    );
+    Ok(rendered.bytes)
 }
 
 // ---------------------------------------------------------------------- tests
@@ -159,6 +232,11 @@ mod tests {
             out: PathBuf::from("."),
             no_footer: false,
             no_images: false,
+            page_size: pdf::PageSize::A4,
+            theme: pdf::Theme::Light,
+            author: None,
+            lang: "tr".to_string(),
+            no_bookmarks: false,
             refresh_filters: false,
             install: false,
             doctor: false,
@@ -194,7 +272,50 @@ mod tests {
             footer: !args.no_footer,
             font_size: 11,
             embed_images: !args.no_images,
+            page: args.page_size,
+            theme: args.theme,
+            bookmarks: !args.no_bookmarks,
         }
+    }
+
+    #[test]
+    fn clap_parses_reading_options() {
+        let a = Args::parse_from([
+            "snappdf",
+            "https://example.com",
+            "--page-size",
+            "a5",
+            "--theme",
+            "dark",
+            "--author",
+            "Gencay",
+            "--lang",
+            "en",
+            "--no-bookmarks",
+        ]);
+        assert_eq!(a.page_size, pdf::PageSize::A5);
+        assert_eq!(a.theme, pdf::Theme::Dark);
+        assert_eq!(a.author.as_deref(), Some("Gencay"));
+        assert_eq!(a.lang, "en");
+        assert!(a.no_bookmarks);
+    }
+
+    #[test]
+    fn clap_defaults_keep_a4_light_and_bookmarks() {
+        let a = Args::parse_from(["snappdf", "https://example.com"]);
+        assert_eq!(a.page_size, pdf::PageSize::A4);
+        assert_eq!(a.theme, pdf::Theme::Light);
+        assert!(!a.no_bookmarks);
+        assert_eq!(a.lang, "tr");
+        assert!(a.author.is_none());
+    }
+
+    #[test]
+    fn clap_rejects_unknown_page_size_and_theme() {
+        assert!(Args::try_parse_from(["snappdf", "https://a.com", "--page-size", "a6"]).is_err());
+        assert!(Args::try_parse_from(["snappdf", "https://a.com", "--theme", "neon"]).is_err());
+        assert!(parse_page_size("A5").is_ok());
+        assert!(parse_theme("Sepia").is_ok());
     }
 
     // --- clap tanımlarının parse düzeyi testleri ---

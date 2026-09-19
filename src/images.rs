@@ -1,37 +1,181 @@
 use genpdf::elements::Image as GenImage;
+use genpdf::Scale;
+use image::GenericImageView;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 /// Görsel önbelleği: aynı URL'yi bir render içinde iki kez indirmemek için.
 static CACHE: Mutex<Option<HashMap<String, image::DynamicImage>>> = Mutex::new(None);
 
-/// URL'den görsel indirir, çözümler ve genpdf Image elemanı üretir.
+/// Bu boyutun altındaki görseller (izleyici pikseli, ikon, ayraç) PDF'e girmez.
+const MIN_PIXELS: u32 = 24;
+
+/// Görselin "doğal" ekran yoğunluğu varsayımı (mutlak punto/mm ölçekleme için).
+const SCREEN_DPI: f64 = 96.0;
+
+// --- yükleme sayaçları (kullanıcıya özet rapor için) ---
+use std::sync::atomic::{AtomicUsize, Ordering};
+static LOADED: AtomicUsize = AtomicUsize::new(0);
+static SKIPPED: AtomicUsize = AtomicUsize::new(0);
+static FAILED: AtomicUsize = AtomicUsize::new(0);
+
+/// Görsel yükleme özeti.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ImageStats {
+    /// PDF'e gömülen görseller.
+    pub loaded: usize,
+    /// Dekoratif/çok küçük olduğu için atlananlar.
+    pub skipped: usize,
+    /// İndirilemeyen/çözümlenemeyenler.
+    pub failed: usize,
+}
+
+/// Sayaçları okur ve sıfırlar.
+pub fn take_stats() -> ImageStats {
+    ImageStats {
+        loaded: LOADED.swap(0, Ordering::Relaxed),
+        skipped: SKIPPED.swap(0, Ordering::Relaxed),
+        failed: FAILED.swap(0, Ordering::Relaxed),
+    }
+}
+
+fn record(outcome: &ImageOutcome) {
+    let counter = match outcome {
+        ImageOutcome::Loaded(_) => &LOADED,
+        ImageOutcome::Skipped => &SKIPPED,
+        ImageOutcome::Failed => &FAILED,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Görsel yükleme sonucu.
+pub enum ImageOutcome {
+    /// PDF'e gömülmeye hazır görsel.
+    Loaded(Box<GenImage>),
+    /// Dekoratif/çok küçük — sessizce atlanır.
+    Skipped,
+    /// İndirilemedi/çözümlenemedi — istenirse not bırakılır.
+    Failed,
+}
+
+/// URL'den görsel indirir, çözümler ve PDF'e sığacak şekilde ölçekler.
 ///
-/// İndirme/çözümleme başarısızsa None döner — görsel hatası PDF'i engellememeli.
-pub fn load_blocking(url: &str) -> Option<GenImage> {
-    load_blocking_inner(url, || network_fetch(url), decode)
+/// `max_width_mm` / `max_height_mm` kullanılabilir alan ölçüleridir. Görsel
+/// büyütülmez (küçük olanlar doğal boyutunda kalır) ama asla alanı taşmaz.
+pub fn load(url: &str, max_width_mm: f64, max_height_mm: f64) -> ImageOutcome {
+    load_with(
+        url,
+        max_width_mm,
+        max_height_mm,
+        || network_fetch(url),
+        decode,
+    )
+}
+
+/// `load` ile aynı, ancak sonucu sayaçlara da işler.
+fn load_with<F, D>(
+    url: &str,
+    max_width_mm: f64,
+    max_height_mm: f64,
+    fetch: F,
+    decode_fn: D,
+) -> ImageOutcome
+where
+    F: FnOnce() -> Option<(bytes::Bytes, &'static str)>,
+    D: FnOnce(bytes::Bytes, &str) -> Option<image::DynamicImage>,
+{
+    let outcome = load_inner(url, max_width_mm, max_height_mm, fetch, decode_fn);
+    record(&outcome);
+    outcome
 }
 
 /// Test edilebilir çekirdek: `fetch` ve `decode` bağımlılıkları parametrik.
-fn load_blocking_inner<F, D>(url: &str, fetch: F, decode_fn: D) -> Option<GenImage>
+fn load_inner<F, D>(
+    url: &str,
+    max_width_mm: f64,
+    max_height_mm: f64,
+    fetch: F,
+    decode_fn: D,
+) -> ImageOutcome
 where
     F: FnOnce() -> Option<(bytes::Bytes, &'static str)>,
     D: FnOnce(bytes::Bytes, &str) -> Option<image::DynamicImage>,
 {
     // Yalnızca http(s) desteklenir (data:/ftp: dışlanır).
     if !url.starts_with("http://") && !url.starts_with("https://") {
-        return None;
+        return ImageOutcome::Failed;
     }
 
-    if let Some(img) = cached(url) {
-        return GenImage::from_dynamic_image(img).ok();
+    let img = match cached(url) {
+        Some(img) => img,
+        None => {
+            let Some((bytes, format)) = fetch() else {
+                return ImageOutcome::Failed;
+            };
+            let Some(img) = decode_fn(bytes, format) else {
+                return ImageOutcome::Failed;
+            };
+            store(url, &img);
+            img
+        }
+    };
+
+    prepare(img, max_width_mm, max_height_mm)
+}
+
+/// Çözümlenmiş görseli PDF elemanına dönüştürür: alfa beyaza düzleştirilir,
+/// dekoratif boyutlar elenir, alan ölçüsüne göre ölçeklenir.
+fn prepare(img: image::DynamicImage, max_width_mm: f64, max_height_mm: f64) -> ImageOutcome {
+    let (px_w, px_h) = img.dimensions();
+    if px_w < MIN_PIXELS || px_h < MIN_PIXELS {
+        return ImageOutcome::Skipped;
     }
 
-    let (bytes, format) = fetch()?;
-    let img = decode_fn(bytes, format)?;
+    // genpdf alfa kanallı görselleri reddeder; beyaz zemin üzerine bindirilir.
+    let rgb = flatten_alpha(img);
 
-    store(url, &img);
-    GenImage::from_dynamic_image(img).ok()
+    let native_w = 25.4 * f64::from(px_w) / SCREEN_DPI;
+    let native_h = 25.4 * f64::from(px_h) / SCREEN_DPI;
+    let k = fit_scale(native_w, native_h, max_width_mm, max_height_mm);
+
+    match GenImage::from_dynamic_image(rgb) {
+        Ok(elem) => ImageOutcome::Loaded(Box::new(
+            elem.with_dpi(SCREEN_DPI)
+                .with_scale(Scale::new(k, k))
+                .with_alignment(genpdf::Alignment::Center),
+        )),
+        Err(_) => ImageOutcome::Failed,
+    }
+}
+
+/// Alfa kanalını beyaz zemin üzerine bindirir (RGBA/RGBA-palette PNG'ler).
+/// Alfa yoksa görsel olduğu gibi döner.
+fn flatten_alpha(img: image::DynamicImage) -> image::DynamicImage {
+    if !img.color().has_alpha() {
+        return img;
+    }
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    let mut out = image::RgbImage::new(w, h);
+    for (x, y, p) in rgba.enumerate_pixels() {
+        let a = u32::from(p[3]);
+        let blend = |c: u8| (((u32::from(c) * a) + 255 * (255 - a)) / 255) as u8;
+        out.put_pixel(x, y, image::Rgb([blend(p[0]), blend(p[1]), blend(p[2])]));
+    }
+    image::DynamicImage::ImageRgb8(out)
+}
+
+/// Görseli `max_w` x `max_h` mm alanına sığdıran ölçek katsayısı.
+/// Küçük görseller büyütülmez (kırıklaşmasın), yalnızca alanı taşanlar küçültülür.
+pub fn fit_scale(width_mm: f64, height_mm: f64, max_w: f64, max_h: f64) -> f64 {
+    let mut k = 1.0_f64;
+    if max_w > 0.0 && width_mm > max_w {
+        k = max_w / width_mm;
+    }
+    if max_h > 0.0 && height_mm * k > max_h {
+        k = max_h / height_mm;
+    }
+    k.clamp(0.01, 1.0)
 }
 
 /// Gerçek ağ üzerinden getiren varsayılan fetch.
@@ -40,19 +184,10 @@ fn network_fetch(url: &str) -> Option<(bytes::Bytes, &'static str)> {
     tokio::task::block_in_place(|| {
         let rt = tokio::runtime::Handle::try_current().ok()?;
         rt.block_on(async {
-            let client = crate::fetch::build_client(std::time::Duration::from_secs(10)).ok()?;
+            let client = crate::fetch::build_client(std::time::Duration::from_secs(15)).ok()?;
             crate::fetch::fetch_image(&client, url).await
         })
     })
-}
-
-#[cfg(test)]
-fn load_blocking_with(
-    url: &str,
-    fetch: impl FnOnce() -> Option<(bytes::Bytes, &'static str)>,
-    decode_fn: impl FnOnce(bytes::Bytes, &str) -> Option<image::DynamicImage>,
-) -> Option<GenImage> {
-    load_blocking_inner(url, fetch, decode_fn)
 }
 
 fn decode(bytes: bytes::Bytes, format: &str) -> Option<image::DynamicImage> {
@@ -64,7 +199,28 @@ fn decode(bytes: bytes::Bytes, format: &str) -> Option<image::DynamicImage> {
         "jpeg" => image::io::Reader::with_format(cursor, image::ImageFormat::Jpeg)
             .decode()
             .ok(),
+        "webp" => decode_webp(&bytes),
         _ => None,
+    }
+}
+
+/// WebP çözer (kayıplı VP8, kayıpsız VP8L ve alfa kanalı birlikte).
+///
+/// `image` 0.23 yalnızca kayıplı VP8'i çözebildiği için `image-webp`
+/// kullanılır: pek çok site kayıpsız/alfalı WebP sunar. Animasyonlu WebP'lerde
+/// ilk kare alınır (PDF'te tek kare gösterilebilir).
+fn decode_webp(bytes: &[u8]) -> Option<image::DynamicImage> {
+    let mut decoder = image_webp::WebPDecoder::new(std::io::Cursor::new(bytes)).ok()?;
+    let (width, height) = decoder.dimensions();
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let mut buffer = vec![0u8; decoder.output_buffer_size()?];
+    decoder.read_image(&mut buffer).ok()?;
+    if decoder.has_alpha() {
+        image::RgbaImage::from_raw(width, height, buffer).map(image::DynamicImage::ImageRgba8)
+    } else {
+        image::RgbImage::from_raw(width, height, buffer).map(image::DynamicImage::ImageRgb8)
     }
 }
 
@@ -89,179 +245,315 @@ pub fn clear_cache() {
     }
 }
 
+/// Önbellek ve yükleme sayaçları globaldir; görsel yükleyen testler bu kilidi
+/// alarak birbirini bekleterek çalışır.
 #[cfg(test)]
-use image::GenericImageView;
+static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Görsel yükleyen testler için paylaşılan kilit.
+#[cfg(test)]
+pub fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+// ---------------------------------------------------------------------- tests
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::GenericImageView;
 
-    /// 1x1 kırmızı PNG.
-    const RED_PNG: &[u8] = &[
-        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
-        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
-        0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08, 0xD7, 0x63, 0xF8,
-        0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D, 0xB0, 0x00, 0x00, 0x00,
-        0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
-    ];
+    fn png_bytes(w: u32, h: u32, rgba: [u8; 4]) -> bytes::Bytes {
+        let img = image::RgbaImage::from_pixel(w, h, image::Rgba(rgba));
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .expect("png kodlanmalı");
+        bytes::Bytes::from(out)
+    }
+
+    fn png_rgb_bytes(w: u32, h: u32, rgb: [u8; 3]) -> bytes::Bytes {
+        let img = image::RgbImage::from_pixel(w, h, image::Rgb(rgb));
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .expect("png kodlanmalı");
+        bytes::Bytes::from(out)
+    }
+
+    fn loaded(outcome: ImageOutcome) -> Option<GenImage> {
+        match outcome {
+            ImageOutcome::Loaded(i) => Some(*i),
+            _ => None,
+        }
+    }
 
     #[test]
     fn rejects_non_http_schemes() {
-        // CACHE'e diğer testlerle yarışmadan dokunmak için kilidi al.
-        let _guard = CACHE_LOCK.lock().unwrap();
+        let _guard = test_lock();
         clear_cache();
-        assert!(load_blocking("data:image/png;base64,AAA").is_none());
-        assert!(load_blocking("ftp://x/y.png").is_none());
-        assert!(load_blocking("").is_none());
+        assert!(matches!(
+            load_with("data:image/png;base64,AAA", 170.0, 200.0, || None, decode),
+            ImageOutcome::Failed
+        ));
+        assert!(matches!(
+            load_with("ftp://x/y.png", 170.0, 200.0, || None, decode),
+            ImageOutcome::Failed
+        ));
+        assert!(matches!(
+            load_with("", 170.0, 200.0, || None, decode),
+            ImageOutcome::Failed
+        ));
     }
 
     #[test]
     fn decode_png_works_and_rejects_garbage() {
-        let img = decode(bytes::Bytes::from_static(RED_PNG), "png");
-        assert!(img.is_some());
+        let ok = decode(png_bytes(4, 4, [255, 0, 0, 255]), "png");
+        assert!(ok.is_some());
         assert!(decode(bytes::Bytes::from_static(b"not an image"), "png").is_none());
-        assert!(decode(bytes::Bytes::from_static(RED_PNG), "webp").is_none());
+        assert!(decode(png_bytes(4, 4, [0, 0, 0, 255]), "webp").is_none());
+        assert!(decode(bytes::Bytes::from_static(b"RIFF....WEBPxx"), "webp").is_none());
     }
 
-    /// Statik CACHE test iş parçacıkları arasında paylaşılır; cache kullanan
-    /// testler bu kilidi alarak serileştirir.
-    static CACHE_LOCK: Mutex<()> = Mutex::new(());
-
-    #[test]
-    fn store_and_cached_roundtrip() {
-        let _guard = CACHE_LOCK.lock().unwrap();
-        clear_cache();
-        let img = image::DynamicImage::new_rgb8(2, 2);
-        assert!(cached("https://x/a.png").is_none());
-        store("https://x/a.png", &img);
-        let got = cached("https://x/a.png");
-        assert!(got.is_some());
-        assert_eq!(got.unwrap().dimensions(), (2, 2));
-        clear_cache();
-        assert!(cached("https://x/a.png").is_none());
+    /// Kayıpsız WebP kodlayıcısıyla üretilmiş gerçek bir WebP dosyası.
+    fn webp_bytes(w: u32, h: u32, rgba: [u8; 4]) -> bytes::Bytes {
+        let pixels: Vec<u8> = (0..w * h).flat_map(|_| rgba).collect();
+        let mut out = Vec::new();
+        image_webp::WebPEncoder::new(&mut out)
+            .encode(&pixels, w, h, image_webp::ColorType::Rgba8)
+            .expect("webp kodlanması");
+        bytes::Bytes::from(out)
     }
 
     #[test]
-    fn cache_is_shared_and_independent_by_url() {
-        let _guard = CACHE_LOCK.lock().unwrap();
+    fn decode_lossless_webp_with_alpha() {
+        // image 0.23 kayıpsız WebP'yi çözemez; image-webp çözer.
+        let data = webp_bytes(8, 8, [255, 0, 0, 128]);
+        let img = decode(data, "webp").expect("webp çözülmeli");
+        assert_eq!(img.dimensions(), (8, 8));
+        assert!(img.color().has_alpha());
+    }
+
+    #[test]
+    fn webp_without_alpha_decodes_as_rgb() {
+        let pixels: Vec<u8> = (0..16).flat_map(|_| [0u8, 128, 255]).collect();
+        let mut out = Vec::new();
+        image_webp::WebPEncoder::new(&mut out)
+            .encode(&pixels, 4, 4, image_webp::ColorType::Rgb8)
+            .unwrap();
+        let img = decode(bytes::Bytes::from(out), "webp").expect("webp çözülmeli");
+        assert_eq!(img.dimensions(), (4, 4));
+        assert_eq!(img.to_rgb8().get_pixel(0, 0).0, [0, 128, 255]);
+    }
+
+    #[test]
+    fn webp_images_go_through_the_full_pipeline() {
+        let _guard = test_lock();
         clear_cache();
-        let a = image::DynamicImage::new_rgb8(3, 3);
-        let b = image::DynamicImage::new_luma8(4, 4);
-        store("https://y/1.png", &a);
-        store("https://y/2.png", &b);
-        assert_eq!(cached("https://y/1.png").unwrap().dimensions(), (3, 3));
-        assert_eq!(cached("https://y/2.png").unwrap().dimensions(), (4, 4));
+        // 200x100 WebP: hazırlama adımından geçip PDF elemanı olmalı.
+        let data = webp_bytes(200, 100, [10, 20, 30, 255]);
+        let outcome = load_with(
+            "http://example.invalid/foto.webp",
+            170.0,
+            200.0,
+            || Some((data.clone(), "webp")),
+            decode,
+        );
+        assert!(loaded(outcome).is_some(), "webp PDF elemanına dönüşmeli");
+    }
+
+    #[test]
+    fn alpha_is_flattened_over_white() {
+        // Tam saydam piksel beyaza, yarı saydam kırmızı pembeleşir.
+        let transparent = flatten_alpha(image::DynamicImage::ImageRgba8(
+            image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 0])),
+        ));
+        assert_eq!(transparent.to_rgb8().get_pixel(0, 0).0, [255, 255, 255]);
+
+        let half_red = flatten_alpha(image::DynamicImage::ImageRgba8(
+            image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 128])),
+        ));
+        let px = half_red.to_rgb8().get_pixel(0, 0).0;
+        assert_eq!(px[0], 255);
+        assert_eq!(px[1], 127);
+        assert_eq!(px[2], 127);
+    }
+
+    #[test]
+    fn rgb_images_pass_through_untouched() {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            2,
+            2,
+            image::Rgb([10, 20, 30]),
+        ));
+        let out = flatten_alpha(img);
+        assert_eq!(out.dimensions(), (2, 2));
+        assert_eq!(out.to_rgb8().get_pixel(0, 0).0, [10, 20, 30]);
+    }
+
+    #[test]
+    fn alpha_images_are_accepted_by_genpdf() {
+        // genpdf alfa kanallı görselleri reddeder; düzleştirme bunu çözer.
+        let _guard = test_lock();
+        clear_cache();
+        let url = "https://mock/alpha.png";
+        let out = load_with(
+            url,
+            170.0,
+            200.0,
+            || Some((png_bytes(60, 40, [255, 0, 0, 128]), "png")),
+            decode,
+        );
+        assert!(
+            loaded(out).is_some(),
+            "RGBA PNG PDF elemanına dönüşebilmeli"
+        );
         clear_cache();
     }
 
     #[test]
-    fn decoded_png_has_expected_dimensions() {
-        let img = decode(bytes::Bytes::from_static(RED_PNG), "png").unwrap();
-        assert_eq!(img.dimensions(), (1, 1));
+    fn tiny_decorative_images_are_skipped_silently() {
+        let _guard = test_lock();
+        clear_cache();
+        let out = load_with(
+            "https://mock/pixel.png",
+            170.0,
+            200.0,
+            || Some((png_rgb_bytes(1, 1, [0, 0, 0]), "png")),
+            decode,
+        );
+        assert!(matches!(out, ImageOutcome::Skipped));
+        clear_cache();
     }
 
     #[test]
-    fn load_blocking_fetches_decodes_and_caches() {
-        let _guard = CACHE_LOCK.lock().unwrap();
+    fn failed_fetch_and_decode_report_failed() {
+        let _guard = test_lock();
         clear_cache();
+        assert!(matches!(
+            load_with("https://mock/broken.png", 170.0, 200.0, || None, decode),
+            ImageOutcome::Failed
+        ));
+        clear_cache();
+        assert!(matches!(
+            load_with(
+                "https://mock/garbage.png",
+                170.0,
+                200.0,
+                || Some((bytes::Bytes::from_static(b"junk"), "png")),
+                decode,
+            ),
+            ImageOutcome::Failed
+        ));
+        clear_cache();
+    }
+
+    #[test]
+    fn fit_scale_never_upscales_and_shrinks_to_fit() {
+        // Küçük görsel büyütülmez.
+        assert_eq!(fit_scale(50.0, 30.0, 170.0, 200.0), 1.0);
+        // Geniş görsel sütun genişliğine küçültülür.
+        let k = fit_scale(400.0, 200.0, 170.0, 200.0);
+        assert!((k - 0.425).abs() < 1e-9);
+        // Çok uzun görsel yükseklik sınırına göre küçültülür.
+        let k = fit_scale(100.0, 1000.0, 170.0, 200.0);
+        assert!((k - 0.2).abs() < 1e-9);
+        // Ölçek asla sıfıra inmez.
+        assert!(fit_scale(100_000.0, 100_000.0, 170.0, 200.0) >= 0.01);
+    }
+
+    #[test]
+    fn oversized_image_is_scaled_down_in_pdf_element() {
+        let _guard = test_lock();
+        clear_cache();
+        // 1200 px genişlik, 96 DPI'da ~317 mm: sütuna sığması için küçültülmeli.
+        let out = load_with(
+            "https://mock/wide.png",
+            170.0,
+            200.0,
+            || Some((png_rgb_bytes(1200, 400, [1, 2, 3]), "png")),
+            decode,
+        );
+        assert!(loaded(out).is_some());
+        clear_cache();
+    }
+
+    #[test]
+    fn network_fetch_is_not_repeated_for_same_url() {
+        let _guard = test_lock();
+        clear_cache();
+        let url = "https://mock/cached.png";
         let mut fetch_count = 0usize;
-        let url = "https://mock/img.png";
 
-        let img = load_blocking_with(
+        let first = load_with(
             url,
+            170.0,
+            200.0,
             || {
                 fetch_count += 1;
-                Some((bytes::Bytes::from_static(RED_PNG), "png"))
+                Some((png_rgb_bytes(50, 50, [9, 9, 9]), "png"))
             },
             decode,
         );
-        assert!(img.is_some());
-        assert_eq!(fetch_count, 1);
-
-        // İkinci istek önbellekten gelmeli; fetch bir kez daha çalışmamalı.
-        let again = load_blocking_with(
+        assert!(loaded(first).is_some());
+        let second = load_with(
             url,
+            170.0,
+            200.0,
             || {
                 fetch_count += 1;
-                Some((bytes::Bytes::from_static(RED_PNG), "png"))
+                Some((png_rgb_bytes(50, 50, [9, 9, 9]), "png"))
             },
             decode,
         );
-        assert!(again.is_some());
-        assert_eq!(fetch_count, 1, "önbellek isabeti ağa gitmamalı");
+        assert!(loaded(second).is_some());
+        assert_eq!(fetch_count, 1, "önbellek isabeti ağa gitmemeli");
         clear_cache();
     }
 
     #[test]
-    fn load_blocking_none_when_fetch_fails() {
-        let _guard = CACHE_LOCK.lock().unwrap();
+    fn stats_count_each_outcome_once() {
+        let _guard = test_lock();
         clear_cache();
-        let img = load_blocking_with("https://mock/broken.png", || None, decode);
-        assert!(img.is_none());
-        clear_cache();
-    }
-
-    #[test]
-    fn load_blocking_none_when_decode_fails_but_fetch_ok() {
-        let _guard = CACHE_LOCK.lock().unwrap();
-        clear_cache();
-        let img = load_blocking_with(
-            "https://mock/garbage.png",
-            || Some((bytes::Bytes::from_static(b"junk"), "png")),
+        let _ = take_stats();
+        let _ = load_with(
+            "https://mock/stats-ok.png",
+            170.0,
+            200.0,
+            || Some((png_rgb_bytes(50, 50, [0, 0, 0]), "png")),
             decode,
         );
-        assert!(img.is_none());
-        clear_cache();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn real_load_blocking_uses_network_fetch_inside_runtime() {
-        // network_fetch yolu (block_in_place + Handle::try_current) gerçek
-        // runtime içinde doğrulanır: mock sunucu üzerinden tam döngü.
-        let _guard = CACHE_LOCK.lock().unwrap();
-        clear_cache();
-
-        // Minik HTTP sunucu: 1x1 PNG döner.
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        let handle = std::thread::spawn(move || {
-            listener.set_nonblocking(true).unwrap();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while std::time::Instant::now() < deadline {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let mut buf = [0u8; 4096];
-                        let _ = stream.read(&mut buf);
-                        let body = RED_PNG;
-                        let resp = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            body.len()
-                        );
-                        let _ = stream.write_all(resp.as_bytes());
-                        let _ = stream.write_all(body);
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                    Err(_) => break,
-                }
+        let _ = load_with(
+            "https://mock/stats-small.png",
+            170.0,
+            200.0,
+            || Some((png_rgb_bytes(2, 2, [0, 0, 0]), "png")),
+            decode,
+        );
+        let _ = load_with("https://mock/stats-fail.png", 170.0, 200.0, || None, decode);
+        let stats = take_stats();
+        assert_eq!(
+            stats,
+            ImageStats {
+                loaded: 1,
+                skipped: 1,
+                failed: 1
             }
-        });
-
-        let url = format!("http://{addr}/real.png");
-        let img = load_blocking(&url);
-        assert!(img.is_some(), "gerçek döngüde görsel yüklenmeli");
+        );
+        // Sayaçlar okunduktan sonra sıfırlanır.
+        assert_eq!(take_stats(), ImageStats::default());
         clear_cache();
-        let _ = handle.join();
     }
 
     #[test]
-    fn load_blocking_none_outside_runtime() {
-        // Runtime olmayan bağlamda network_fetch None dönmeli (panik değil).
-        let _guard = CACHE_LOCK.lock().unwrap();
+    fn load_blocking_fails_gracefully_outside_runtime() {
+        // Runtime olmayan bağlamda panik değil, Failed dönmeli.
+        let _guard = test_lock();
         clear_cache();
-        assert!(load_blocking("https://örnek-yok.example/a.png").is_none());
+        assert!(matches!(
+            load("https://örnek-yok.example/a.png", 170.0, 200.0),
+            ImageOutcome::Failed | ImageOutcome::Skipped
+        ));
         clear_cache();
     }
 }

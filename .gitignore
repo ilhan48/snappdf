@@ -1,0 +1,25 @@
+# Rust build çıktıları
+/target/
+**/*.rs.bk
+
+# snappdf çıktıları — üretilen PDF'ler repo'ya girmez
+*.pdf
+
+# Coverage
+lcov.info
+*.profraw
+*.profdata
+
+# Ortam / editör
+.env
+.env.local
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS / Windows / Linux
+.DS_Store
+Thumbs.db
+Desktop.ini
