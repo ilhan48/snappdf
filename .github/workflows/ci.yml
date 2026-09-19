@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain (stable, rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Format kontrolü
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (uyarı = hata)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Testler
+        run: cargo test --all-targets
+
+      - name: Release build
+        run: cargo build --release
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain (stable, llvm-tools)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: cargo-llvm-cov kur
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cov-${{ hashFiles('Cargo.lock') }}
+
+      - name: Coverage raporu (lcov + özet)
+        run: cargo llvm-cov --all-targets --lcov --output-path lcov.info
+
+      - name: Coveralls'a yükle
+        uses: coverallsapp/github-action@v2
+        with:
+          files: lcov.info
+          fail-on-error: false

@@ -1,0 +1,21 @@
+[package]
+name = "snappdf"
+version = "0.2.0"
+edition = "2021"
+description = "Link -> güzel PDF: tarayıcısız, reklam/izleyici temizliğini adblock motoruyla yapan PDF üretici"
+
+[dependencies]
+adblock = { version = "0.13", default-features = false, features = ["embedded-domain-resolver", "full-regex-handling", "addr"] }
+anyhow = "1"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+genpdf = { version = "0.2", features = ["images"] }
+image = { version = "0.23", default-features = false, features = ["png", "jpeg"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "gzip", "charset"] }
+scraper = "0.24"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[profile.release]
+lto = "thin"
+strip = true
