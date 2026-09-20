@@ -1,6 +1,9 @@
 use ego_tree::NodeRef;
 use scraper::node::Node;
 use scraper::{ElementRef, Html, Selector};
+// `parent_element` gibi ağaç yardımcıları için trait kapsamda olmalı.
+use scraper::Element as _;
+use std::collections::BTreeSet;
 
 /// Çıkarılan makale.
 #[derive(Debug, Clone)]
@@ -40,7 +43,15 @@ pub enum Block {
     Paragraph(String),
     /// Görsel altı açıklaması (figcaption).
     Caption(String),
-    Code(String),
+    /// Kod bloğu (`<pre>`). `lang`, şablon sınıflarından çıkarılan dil ipucudur
+    /// (`language-rust`, `highlight-source-python` ...); yoksa `None`.
+    /// `highlights` blogun vurguladığı satırların **0 tabanlı** indeksleridir
+    /// (artan sırada): PDF'te bu satırlar renkli bir bantla basılır.
+    Code {
+        text: String,
+        lang: Option<String>,
+        highlights: Vec<usize>,
+    },
     Quote(String),
     /// Liste ögesi. `depth` iç içe liste derinliği (0 = en dış).
     ListItem {
@@ -700,10 +711,13 @@ impl<'a> Walker<'a> {
                 }
             }
             "pre" => {
-                let text = own_text(el);
-                let trimmed = text.trim_end_matches(['\n', ' ']).to_string();
-                if !trimmed.trim().is_empty() {
-                    out.push(Block::Code(trimmed));
+                let (text, highlights) = code_body(el);
+                if !text.trim().is_empty() {
+                    out.push(Block::Code {
+                        text,
+                        lang: code_language(el),
+                        highlights,
+                    });
                 }
             }
             "blockquote" => {
@@ -794,6 +808,447 @@ impl<'a> Walker<'a> {
 
 fn img_selector() -> Selector {
     Selector::parse("img").expect("geçerli seçici")
+}
+
+/// Sınıf metninde tek başına geçtiğinde dil *sayılmayan* belirteçler.
+///
+/// Vurgulama kitaplıkları kabı da işaretler (`hljs`, `highlight`, `code` ...);
+/// bunlar dil ipucu değildir.
+const NON_LANGUAGE_TOKENS: &[&str] = &[
+    "hljs",
+    "highlight",
+    "code",
+    "pre",
+    "prettyprint",
+    "linenums",
+    "source",
+    "syntax",
+    "chroma",
+    "codehilite",
+    "plaintext",
+    "text",
+    "nohighlight",
+    "brush",
+    "lang",
+    "language",
+];
+
+/// Sınıf önekleri: `language-rust`, `lang-py`, `highlight-source-go` ...
+const LANGUAGE_PREFIXES: &[&str] = &[
+    "language-",
+    "lang-",
+    "highlight-source-",
+    "highlight-",
+    "brush-",
+    "prism-",
+    "syntax-",
+];
+
+/// Kod bloğunun dil ipucunu HTML'den çıkarır.
+///
+/// `<pre>` gövdesini ve blogun vurguladığı satırları (0 tabanlı) çıkarır.
+fn code_body(el: ElementRef) -> (String, Vec<usize>) {
+    let scan = code_text(el);
+    let text = scan.text;
+    let text = text.trim_end_matches(['\n', ' ']);
+    let lines: Vec<&str> = text.split('\n').collect();
+
+    let mut marks = scan.marks;
+    marks.retain(|index| *index < lines.len());
+    marks.extend(range_marks(el, lines.len()));
+
+    // İçerik yönergeleri (Docusaurus, Expressive Code ...): `// highlight-start`
+    // satırları PDF'e basılmaz, işaretledikleri satırlar vurgulanır.
+    let mut drop = vec![false; lines.len()];
+    let mut in_block = false;
+    let mut next_line = false;
+    for (index, line) in lines.iter().enumerate() {
+        match highlight_directive(line) {
+            Some(Directive::Next) => {
+                drop[index] = true;
+                next_line = true;
+            }
+            Some(Directive::Start) => {
+                drop[index] = true;
+                in_block = true;
+            }
+            Some(Directive::End) => {
+                drop[index] = true;
+                in_block = false;
+            }
+            None => {
+                if in_block || next_line {
+                    marks.insert(index);
+                }
+                next_line = false;
+            }
+        }
+    }
+
+    let mut body = String::new();
+    let mut highlights = Vec::new();
+    let mut kept = 0usize;
+    for (index, line) in lines.iter().enumerate() {
+        if drop[index] {
+            continue;
+        }
+        if marks.contains(&index) {
+            highlights.push(kept);
+        }
+        if kept > 0 {
+            body.push('\n');
+        }
+        body.push_str(line);
+        kept += 1;
+    }
+
+    (body, highlights)
+}
+
+/// Kod metni ve vurgulu satırları tek geçişte toplayan gezgin.
+#[derive(Default)]
+struct CodeScan {
+    /// `<pre>` metni: satır sonları **birebir** korunur.
+    text: String,
+    /// Şu ana kadar geçilen satır sonu sayısı (= geçerli satır indeksi).
+    line: usize,
+    /// Vurgulu satırlar.
+    marks: BTreeSet<usize>,
+    /// `<mark>` elemanlarının metindeki bayt aralıkları ve başladıkları satır.
+    /// İşaret satırın tamamını mı kaplıyor, tarama bitince metne bakarak
+    /// karar verilir (bkz. `mark_spans_to_lines`).
+    mark_spans: Vec<(usize, usize, usize)>,
+}
+
+/// `<pre>` metnini ve blogun "bu satır vurgulu" dediği satırları çıkarır.
+///
+/// Metin `own_text` ile toplanmaz: o, her metin düğümünden sonra bir ayraç
+/// boşluğu koyar. Söz dizimi renklendirmesi kodu `<span>` parçalarına böldüğü
+/// için (`<span class="line"><span class="cl">kod\n</span></span>`) bu boşluk
+/// her satırın başına fazladan bir karakter ekler ve girintiyi kaydırırdı.
+/// Kod bloğunda metin düğümleri zaten birebir basılır.
+///
+/// Şablonlar vurguyu üç yolla bırakır:
+/// 1. **Satır sarmalayıcı**: `class="line highlighted"` (Docusaurus, Nextra),
+///    `class="hll"` (Rouge), `class="line hl"` (Chroma/Hugo),
+///    `data-highlighted-line` (rehype-pretty-code/Shiki),
+/// 2. **`<mark>`**: Expressive Code/Starlight işaretli satırı sarar,
+/// 3. **Satır aralığı**: Prism'in `line-highlight` katmanı (`data-range`).
+fn code_text(root: ElementRef) -> CodeScan {
+    let mut scan = CodeScan::default();
+    for child in root.children() {
+        scan_node(child, &mut scan);
+    }
+    mark_spans_to_lines(&mut scan);
+    scan
+}
+
+/// `<mark>` işaretlerini satır vurgusına çevirir — yalnızca işaret satırın
+/// **tamamını** kaplıyorsa.
+///
+/// Expressive Code (Starlight) tam satır vurgusunu da, satır içi tek bir
+/// ifadeyi de `<mark>` ile sarar. İfade işaretinde bütün satırı vurgulamak
+/// yanıltıcı olurdu; bu yüzden işaretin başladığı ve bittiği yerin satır
+/// sınırında olması aranır (girinti/boşluk hoş görülür).
+fn mark_spans_to_lines(scan: &mut CodeScan) {
+    for (start, end, line) in std::mem::take(&mut scan.mark_spans) {
+        let text = &scan.text;
+        let at_start = text[..start.min(text.len())]
+            .rsplit('\n')
+            .next()
+            .is_some_and(|head| head.chars().all(|c| matches!(c, ' ' | '\t')));
+        let at_end = text[end.min(text.len())..]
+            .split('\n')
+            .next()
+            .is_some_and(|tail| tail.chars().all(|c| matches!(c, ' ' | '\t' | '\r')));
+        if at_start && at_end {
+            scan.marks.insert(line);
+        }
+    }
+}
+
+/// Ağacı gezerken metni toplar, satır numarasını sayar ve vurgulu elemanların
+/// kapsadığı satırları işaretler.
+fn scan_node(node: NodeRef<Node>, scan: &mut CodeScan) {
+    if let Some(el) = ElementRef::wrap(node) {
+        if skip_element(&el) {
+            return;
+        }
+        if el.value().name() == "br" {
+            scan.text.push('\n');
+            scan.line += 1;
+            return;
+        }
+        let start = scan.line;
+        let start_len = scan.text.len();
+        let is_mark = el.value().name() == "mark";
+        let marked = is_mark || is_highlighted(el);
+        for child in node.children() {
+            scan_node(child, scan);
+        }
+        if marked {
+            // Elemanın son satırı: sondaki boşluk/satır sonları sayılmaz, çünkü
+            // `<span class="line hl">kod\n</span>` sonraki satırı kapsamaz.
+            let inner = &scan.text[start_len..];
+            let last = start + inner.trim_end_matches(['\n', ' ', '\t', '\r']).matches('\n').count();
+            if is_mark {
+                scan.mark_spans.push((start_len, scan.text.len(), start));
+            } else {
+                for index in start..=last {
+                    scan.marks.insert(index);
+                }
+            }
+        }
+        return;
+    }
+    if let Some(text) = node.value().as_text() {
+        scan.text.push_str(text);
+        scan.line += text.matches('\n').count();
+    }
+}
+
+/// Bir elemanın vurgulu satır olduğunu gösteren sınıf adları (tam belirteç).
+const HIGHLIGHT_TOKENS: &[&str] = &[
+    "highlighted",
+    "highlight",
+    "hl",
+    "hll",
+    "highlight-line",
+    "highlighted-line",
+    "is-highlighted",
+    "line-highlighted",
+    "mark",
+    "marked",
+];
+
+/// Sınıf belirteci bu eklerden biriyle bitiyorsa vurgudur.
+///
+/// Şablonlar kendi ad alanlarını önek olarak kullanır: Docusaurus
+/// `theme-code-block-highlighted-line`, VitePress `line highlighted`,
+/// Starlight `ec-line highlight` yazar. Tam belirteç listesi bunları
+/// kaçırırdı. Ekler `hl`/`hll` için aranmaz: `html` gibi bir belirteç
+/// yanlışlıkla vurgu sayılırdı.
+const HIGHLIGHT_SUFFIXES: &[&str] = &[
+    "-highlighted-line",
+    "-highlighted",
+    "-highlight-line",
+    "-highlighted-lines",
+];
+
+/// Vurgu öznitelikleri. Bu adlar yalnızca vurgu için kullanılır, bu yüzden
+/// **varlıkları** işarettir: boş değer (`data-highlighted-line=""`) ya da
+/// değersiz (boolean) öznitelik de vurgu demektir — Shiki ve
+/// rehype-pretty-code tam olarak böyle yazar.
+const HIGHLIGHT_ATTRS: &[&str] = &[
+    "data-highlighted-line",
+    "data-line-highlight",
+    "data-highlight-line",
+    "data-highlight",
+];
+
+/// Eleman blogun vurguladığı bir satır mı?
+///
+/// Sınıf adları **tam belirteç** olarak karşılaştırılır: `class="hljs"` ya da
+/// `class="highlight-source-rust"` (GitHub'ın kabı) vurgu sayılmaz, aksi
+/// hâlde tüm blok vurgulu görünürdü.
+fn is_highlighted(el: ElementRef) -> bool {
+    if el.value().name() == "mark" {
+        return true;
+    }
+    for attr in HIGHLIGHT_ATTRS {
+        if let Some(value) = el.value().attr(attr) {
+            if !matches!(value.trim(), "false" | "0") {
+                return true;
+            }
+        }
+    }
+    let Some(class) = el.value().attr("class") else {
+        return false;
+    };
+    class.split_whitespace().any(|token| {
+        let token = token.to_ascii_lowercase();
+        HIGHLIGHT_TOKENS.contains(&token.as_str())
+            || HIGHLIGHT_SUFFIXES.iter().any(|suffix| token.ends_with(suffix))
+    })
+}
+
+/// Prism'in `line-highlight` katmanından satır aralıklarını okur.
+///
+/// Katman `<pre>` içine `data-range="2, 5-7"` ile yerleştirilir; numaralar
+/// 1 tabanlıdır ve `data-line-offset` kadar kayabilir. `<pre>` üzerindeki
+/// `data-line` yalnızca aralık listesi gibi görünüyorsa (virgül ya da tire
+/// içeriyorsa) dikkate alınır: rehype-pretty-code her satıra tek bir numara
+/// için `data-line="4"` yazar, o bir aralık değildir.
+fn range_marks(el: ElementRef, line_count: usize) -> BTreeSet<usize> {
+    let mut marks = BTreeSet::new();
+    let mut targets: Vec<(ElementRef, bool)> = vec![(el, true)];
+    if let Some(parent) = el.parent_element() {
+        if has_token(parent, "line-highlight") {
+            targets.push((parent, false));
+        }
+    }
+    if let Ok(selector) = Selector::parse(".line-highlight") {
+        targets.extend(el.select(&selector).map(|inner| (inner, false)));
+    }
+
+    for (target, strict) in targets {
+        let offset = target
+            .value()
+            .attr("data-line-offset")
+            .or_else(|| el.value().attr("data-line-offset"))
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        for attr in ["data-range", "data-line"] {
+            let Some(raw) = target.value().attr(attr) else {
+                continue;
+            };
+            // `<pre data-line="4">`: tek numara, satır aralığı değil.
+            if strict && !raw.contains([',', '-']) {
+                continue;
+            }
+            for (start, end) in parse_ranges(raw) {
+                for number in start..=end {
+                    let index = number.saturating_sub(1) + offset;
+                    if index < line_count {
+                        marks.insert(index);
+                    }
+                }
+            }
+            break;
+        }
+    }
+    marks
+}
+
+/// Bir elemanın sınıfında tam belirteç var mı?
+fn has_token(el: ElementRef, token: &str) -> bool {
+    el.value()
+        .attr("class")
+        .is_some_and(|class| class.split_whitespace().any(|t| t.eq_ignore_ascii_case(token)))
+}
+
+/// `"2, 5-7"` -> `[(2, 2), (5, 7)]` (1 tabanlı, kapsayıcı).
+fn parse_ranges(raw: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for part in raw.split([',', ' ']) {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (start, end) = match part.split_once('-') {
+            Some((a, b)) => (a.trim(), b.trim()),
+            None => (part, part),
+        };
+        let (Ok(start), Ok(end)) = (start.parse::<usize>(), end.parse::<usize>()) else {
+            continue;
+        };
+        if start > 0 && end >= start {
+            out.push((start, end));
+        }
+    }
+    out
+}
+
+/// İçerik yönergesi türü.
+enum Directive {
+    /// Sonraki satır vurgulu.
+    Next,
+    /// Vurgu bloğu başlangıcı.
+    Start,
+    /// Vurgu bloğu sonu.
+    End,
+}
+
+/// `// highlight-next-line`, `# highlight-start` gibi yönerge satırlarını tanır.
+///
+/// Yönergenin kendisi bir yorum satırı olmalıdır (`//`, `#`, `--`, `;`, `%`
+/// ya da `<!-- ... -->`); kod içinde geçen bir metin yönerge sayılmaz.
+fn highlight_directive(line: &str) -> Option<Directive> {
+    const MARKERS: &[char] = &['/', '#', '-', ';', '<', '!', '*', '%'];
+    let trimmed = line.trim();
+    if !trimmed.starts_with(MARKERS) {
+        return None;
+    }
+    let body = trimmed.trim_start_matches(|c: char| !c.is_alphanumeric());
+    for (name, directive) in [
+        ("highlight-next-line", Directive::Next),
+        ("highlight-start", Directive::Start),
+        ("highlight-end", Directive::End),
+    ] {
+        if let Some(tail) = body.strip_prefix(name) {
+            if tail
+                .chars()
+                .all(|c| c.is_whitespace() || MARKERS.contains(&c) || c == '>')
+            {
+                return Some(directive);
+            }
+        }
+    }
+    None
+}
+
+/// Aynı `<pre>`, `<code>` ya da onları saran `<div>` üzerinde farklı şablonlar
+/// farklı işaretler kullanır: `class="language-rust"` (Prism),
+/// `class="highlight-source-rust"` (GitHub), `data-language="rust"`,
+/// `class="prettyprint lang-py"`, `class="brush: rust"` ... Hepsi denenir.
+/// Tanınan bir dil bulunamazsa `None` döner ve PDF katmanı yaygın kurallarla
+/// renklendirir.
+fn code_language(el: ElementRef) -> Option<String> {
+    let mut candidates = vec![el];
+    if let Some(parent) = el.parent_element() {
+        candidates.push(parent);
+    }
+    if let Ok(inner) = Selector::parse("code, span, div") {
+        candidates.extend(el.select(&inner));
+    }
+    candidates.into_iter().find_map(language_hint)
+}
+
+/// Tek bir elemandan dil ipucu: önce `data-*` öznitelikleri, sonra `class`.
+fn language_hint(el: ElementRef) -> Option<String> {
+    let value = el.value();
+    for attr in ["data-language", "data-lang", "lang"] {
+        if let Some(raw) = value.attr(attr) {
+            if let Some(lang) = language_from_tokens(raw) {
+                return Some(lang);
+            }
+        }
+    }
+    language_from_tokens(value.attr("class")?)
+}
+
+/// Belirteç listesinden dil adını çözer (`"hljs language-rust"` -> `rust`).
+fn language_from_tokens(raw: &str) -> Option<String> {
+    let mut expect_language = false;
+    for token in raw.split_whitespace() {
+        let token = token
+            .trim_matches(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '+' | '#' | '-' | '_'))
+            .to_ascii_lowercase();
+        if token.is_empty() {
+            continue;
+        }
+        if expect_language {
+            // `brush: rust` — dil adı işaretten sonraki belirteçtedir.
+            return Some(crate::highlight::normalize_lang(&token));
+        }
+        if token == "brush" {
+            expect_language = true;
+            continue;
+        }
+        for prefix in LANGUAGE_PREFIXES {
+            if let Some(rest) = token.strip_prefix(prefix) {
+                if !rest.is_empty() {
+                    return Some(crate::highlight::normalize_lang(rest));
+                }
+            }
+        }
+        if !NON_LANGUAGE_TOKENS.contains(&token.as_str())
+            && crate::highlight::is_known_language(&token)
+        {
+            return Some(crate::highlight::normalize_lang(&token));
+        }
+    }
+    None
 }
 
 /// HTML'den makale içeriğini çıkarır. `base` görsel URL'lerinin çözümü için kullanılır.
@@ -1002,8 +1457,13 @@ mod tests {
         assert!(art
             .blocks
             .iter()
-            .any(|b| matches!(b, Block::Code(c) if c.contains("println"))));
+            .any(|b| matches!(b, Block::Code { text, .. } if text.contains("println"))));
         assert!(art.blocks.iter().any(|b| matches!(b, Block::Quote(_))));
+        // Sınıfsız `<pre>`: dil ipucusu yok, renklendirme yaygın kurallarla.
+        assert!(art
+            .blocks
+            .iter()
+            .any(|b| matches!(b, Block::Code { lang: None, .. })));
         assert!(art
             .blocks
             .iter()
@@ -1017,6 +1477,219 @@ mod tests {
             art.images,
             vec!["https://ornek.com/img/macera.png".to_string()]
         );
+    }
+
+    #[test]
+    fn code_block_language_is_read_from_common_templates() {
+        // Farklı şablonlar dil işaretini farklı yerlere koyar: sınıf, `<code>`
+        // sınıfı, `data-*` özniteliği, saran `<div>` ya da `brush: x` kalıbı.
+        let cases: &[(&str, Option<&str>)] = &[
+            (
+                r#"<pre class="language-rust"><code>fn main() {}</code></pre>"#,
+                Some("rust"),
+            ),
+            (
+                r#"<pre class="lang-py"><code>print(1)</code></pre>"#,
+                Some("python"),
+            ),
+            (
+                r#"<pre class="highlight-source-go"><code>func main() {}</code></pre>"#,
+                Some("go"),
+            ),
+            (
+                r#"<pre><code class="language-js">let a = 1;</code></pre>"#,
+                Some("javascript"),
+            ),
+            (
+                r#"<pre data-language="bash"><code>ls -la</code></pre>"#,
+                Some("bash"),
+            ),
+            (
+                r#"<pre class="brush: cpp"><code>int main() {}</code></pre>"#,
+                Some("cpp"),
+            ),
+            (
+                r#"<div class="highlight highlight-source-python"><pre><code>x = 1</code></pre></div>"#,
+                Some("python"),
+            ),
+            (r#"<pre class="wp-block-code"><code>genel</code></pre>"#, None),
+            (r#"<pre><code>genel kod</code></pre>"#, None),
+        ];
+        for (html, expected) in cases.iter().copied() {
+            let blocks = blocks_of(&article_html(html));
+            let lang = blocks
+                .iter()
+                .find_map(|b| match b {
+                    Block::Code { lang, .. } => Some(lang.clone()),
+                    _ => None,
+                })
+                .expect("kod bloğu bulunmalı");
+            assert_eq!(lang.as_deref(), expected, "{html}");
+        }
+    }
+
+    /// Tek kod bloğunun metni ve vurgulu satırları.
+    fn code_of(html: &str) -> (String, Vec<usize>) {
+        let blocks = blocks_of(&article_html(html));
+        blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::Code {
+                    text, highlights, ..
+                } => Some((text.clone(), highlights.clone())),
+                _ => None,
+            })
+            .expect("kod bloğu bulunmalı")
+    }
+
+    #[test]
+    fn highlighted_lines_come_from_line_wrappers() {
+        // Docusaurus/Nextra (`class="line highlighted"`), Rouge (`hll`) ve
+        // Chroma/Hugo (`class="line hl"`) satırı sarmalayıcıyla işaretler;
+        // sondaki satır sonu sonraki satırı kapsamamalı.
+        let (text, marks) = code_of(
+            "<pre class=\"language-rust\"><code>\
+             <span class=\"line\">let a = 1;\n</span>\
+             <span class=\"line highlighted\">let b = 2;\n</span>\
+             <span class=\"line\">let c = 3;\n</span></code></pre>",
+        );
+        assert_eq!(text, "let a = 1;\nlet b = 2;\nlet c = 3;");
+        assert_eq!(marks, vec![1], "yalnız ikinci satır vurgulu");
+
+        let (_, marks) = code_of(
+            "<pre><code><span class=\"hll\">ilk\n</span><span>ikinci\n</span></code></pre>",
+        );
+        assert_eq!(marks, vec![0]);
+
+        let (_, marks) = code_of(
+            "<pre><code><span class=\"line\">a\n</span><span class=\"line hl\">b\n</span></code></pre>",
+        );
+        assert_eq!(marks, vec![1]);
+    }
+
+    #[test]
+    fn marked_attributes_and_mark_tags_highlight_their_line() {
+        // rehype-pretty-code/Shiki `data-highlighted-line` yazar, Expressive
+        // Code/Starlight işaretli satırı `<mark>` ile sarar.
+        let (_, marks) = code_of(
+            "<pre><code><span data-line=\"1\">a</span>\n\
+             <span data-highlighted-line=\"\">b</span>\n\
+             <span data-line=\"3\">c</span></code></pre>",
+        );
+        assert_eq!(marks, vec![1]);
+
+        let (_, marks) = code_of(
+            "<pre><code>birinci\n<mark>ikinci</mark>\nüçüncü</code></pre>",
+        );
+        assert_eq!(marks, vec![1], "<mark> bulunduğu satırı işaretler");
+    }
+
+    #[test]
+    fn prism_line_highlight_ranges_are_read() {
+        // Prism katmanı `<pre>` içine `data-range="2, 4-5"` ile yerleşir;
+        // `data-line-offset` numaraları kaydırır.
+        let (_, marks) = code_of(
+            "<pre class=\"language-js\" data-range=\"2, 4-5\">\
+             <div class=\"line-highlight\" data-range=\"2, 4-5\"></div>\
+             <code>a\nb\nc\nd\ne\nf</code></pre>",
+        );
+        assert_eq!(marks, vec![1, 3, 4]);
+
+        let (_, marks) = code_of(
+            "<pre class=\"language-js\" data-line-offset=\"2\" data-range=\"1-2\">\
+             <div class=\"line-highlight\" data-range=\"1-2\"></div>\
+             <code>a\nb\nc\nd</code></pre>",
+        );
+        assert_eq!(marks, vec![2, 3]);
+
+        // `<pre data-line="4">`: tek numara bir aralık değildir (rehype her
+        // satıra numara yazar), yok sayılır.
+        let (_, marks) = code_of(
+            "<pre data-line=\"4\"><code>\
+             <span data-line=\"1\">a</span>\n<span data-line=\"2\">b</span></code></pre>",
+        );
+        assert!(marks.is_empty(), "tek numara aralık sayılmamalı: {marks:?}");
+    }
+
+    #[test]
+    fn content_directives_mark_and_drop_their_lines() {
+        // Docusaurus/Expressive Code: yönerge satırı PDF'e basılmaz, sonraki
+        // satır (ya da blok) vurgulanır.
+        let (text, marks) = code_of(
+            "<pre class=\"language-rust\"><code>\
+             // highlight-next-line\nlet a = 1;\nlet b = 2;\n\
+             // highlight-start\nlet c = 3;\nlet d = 4;\n// highlight-end\nlet e = 5;\
+             </code></pre>",
+        );
+        assert_eq!(text, "let a = 1;\nlet b = 2;\nlet c = 3;\nlet d = 4;\nlet e = 5;");
+        assert_eq!(marks, vec![0, 2, 3]);
+
+        // Yönerge olmayan yorumlar korunur.
+        let (text, marks) = code_of(
+            "<pre><code><span class=\"line\"># highlightler\n</span>\
+             <span># not</span></code></pre>",
+        );
+        assert!(marks.is_empty(), "{marks:?}");
+        assert!(text.contains("highlightler"));
+    }
+
+    #[test]
+    fn prefixed_highlight_classes_are_recognized() {
+        // Docusaurus satırları `<div class="token-line">` içine koyar ve
+        // vurguyu kendi ad alanıyla işaretler: `<br/>` satır sonudur.
+        let (text, marks) = code_of(
+            "<pre class=\"language-js\"><code>\
+             <div class=\"token-line\">ilk<br/></div>\
+             <div class=\"token-line theme-code-block-highlighted-line\">ikinci<br/></div>\
+             <div class=\"token-line\">üçüncü<br/></div></code></pre>",
+        );
+        assert_eq!(text, "ilk\nikinci\nüçüncü");
+        assert_eq!(marks, vec![1]);
+    }
+
+    #[test]
+    fn inline_mark_is_not_a_whole_line_highlight() {
+        // Expressive Code/Starlight satır içi tek bir ifadeyi de `<mark>` ile
+        // sarar; o durumda bütün satırı vurgulamak yanıltıcı olurdu.
+        let (_, marks) = code_of("<pre><code>// <mark>ifade</mark> burada\nsatır iki</code></pre>");
+        assert!(marks.is_empty(), "ifade işareti satır vurgusu değil: {marks:?}");
+
+        // Satırın tamamını kaplayan işaret vurgudur (baştaki girinti hoş görülür).
+        let (_, marks) = code_of(
+            "<pre><code>ilk\n  <mark>ikinci satır tamamen</mark>\nüçüncü</code></pre>",
+        );
+        assert_eq!(marks, vec![1]);
+    }
+
+    #[test]
+    fn code_text_keeps_lines_verbatim() {
+        // Renklendirme kodu `<span>` parçalarına böler. Araya ayraç boşluğu
+        // konursa sarmalayıcıyla yazılan her satır bir boşlukla kayar;
+        // sarmalayıcılı ve sarmalayıcısız bloklar birebir aynı metni vermeli.
+        let (wrapped, _) = code_of(
+            "<pre class=\"chroma\"><code>\
+             <span class=\"line\"><span class=\"cl\">fn main() {\n</span></span>\
+             <span class=\"line\"><span class=\"cl\">    println!(\"x\");\n</span></span>\
+             </code></pre>",
+        );
+        let (plain, _) = code_of("<pre><code>fn main() {\n    println!(\"x\");</code></pre>");
+        assert_eq!(wrapped, "fn main() {\n    println!(\"x\");");
+        assert_eq!(wrapped, plain, "sarmalayıcı metni değiştirmemeli");
+    }
+
+    #[test]
+    fn container_classes_are_not_highlights() {
+        // GitHub'ın kabı (`class="highlight highlight-source-rust"`) ve
+        // highlight.js'in `hljs` sınıfı vurgu sayılmamalı; aksi hâlde tüm blok
+        // vurgulu görünürdü.
+        for html in [
+            "<pre class=\"highlight highlight-source-rust\"><code>a\nb</code></pre>",
+            "<pre><code class=\"hljs\">a\nb</code></pre>",
+            "<pre class=\"language-html\"><code class=\"language-html\">a\nb</code></pre>",
+        ] {
+            let (_, marks) = code_of(html);
+            assert!(marks.is_empty(), "vurgu beklenmiyordu: {html}");
+        }
     }
 
     #[test]

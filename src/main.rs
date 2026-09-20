@@ -2,11 +2,13 @@ mod blocker;
 mod extract;
 mod fetch;
 mod fonts;
+mod highlight;
 mod images;
 mod install;
 mod lists;
 mod pdf;
 mod postprocess;
+mod translate;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -43,6 +45,23 @@ struct Args {
     #[arg(long, default_value = "light", value_parser = parse_theme)]
     theme: pdf::Theme,
 
+    /// Kod bloğu paleti: auto | github-light | github-dark | monokai |
+    /// solarized-light | solarized-dark | sepia (auto: sayfa temasına uyar)
+    #[arg(long, default_value = "auto", value_parser = parse_code_theme)]
+    code_theme: pdf::CodeTheme,
+
+    /// Kod bloklarında satır numarası gösterme
+    #[arg(long, default_value_t = false)]
+    no_line_numbers: bool,
+
+    /// Kod bloğunun üstündeki dil rozetini gösterme
+    #[arg(long, default_value_t = false)]
+    no_code_badge: bool,
+
+    /// Blogun vurguladığı kod satırlarını renkli bantla basma
+    #[arg(long, default_value_t = false)]
+    no_line_highlights: bool,
+
     /// Gövde yazı tipi büyüklüğü, pt (8-16; tablet+kalem okuma için 12 önerilir)
     #[arg(long, default_value_t = 11, value_parser = parse_font_size)]
     font_size: u8,
@@ -54,6 +73,14 @@ struct Args {
     /// İçerik dili etiketi (PDF /Lang)
     #[arg(long, default_value = "tr")]
     lang: String,
+
+    /// Makaleyi Google Translate ile Türkçeye çevir (kod blokları korunur)
+    #[arg(long, default_value_t = false)]
+    tr: bool,
+
+    /// `--tr` ile birlikte hedef dil kodu (ör. en, de, es)
+    #[arg(long, default_value = "tr")]
+    target_lang: String,
 
     /// Başlıklardan PDF yer imi (içindekiler) üretme
     #[arg(long, default_value_t = false)]
@@ -82,6 +109,16 @@ fn parse_page_size(value: &str) -> Result<pdf::PageSize, String> {
 fn parse_theme(value: &str) -> Result<pdf::Theme, String> {
     pdf::Theme::parse(value)
         .ok_or_else(|| format!("bilinmeyen tema '{value}' (light, dark, sepia)"))
+}
+
+/// `--code-theme` değerini çözer.
+fn parse_code_theme(value: &str) -> Result<pdf::CodeTheme, String> {
+    pdf::CodeTheme::parse(value).ok_or_else(|| {
+        format!(
+            "bilinmeyen kod teması '{value}' (auto, github-light, github-dark, monokai, \
+             solarized-light, solarized-dark, sepia)"
+        )
+    })
 }
 
 /// `--font-size` değerini çözer (8-16 pt).
@@ -168,6 +205,14 @@ async fn render_url(
     let mut article = extract::extract(&html, url, &extract::ExtractOptions::default())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    // --tr: makaleyi hedef dile çevir (varsayılan Türkçe). Başarısız bloklar
+    // orijinal kalır; çeviri PDF üretimini asla engellemez.
+    if args.tr {
+        eprintln!("[çeviri] Google Translate → {} ...", args.target_lang);
+        let translator = translate::Translator::new(&args.target_lang)?;
+        translate::translate_article(&mut article, &translator).await;
+    }
+
     // Reklam/izleyici görselleri adblock motoruyla süzülür. Hem görsel
     // listesinden hem de bloklardan çıkarılır; aksi halde engellenen görsel
     // PDF'e yine girerdi.
@@ -191,6 +236,10 @@ async fn render_url(
         embed_images: !args.no_images,
         page: args.page_size,
         theme: args.theme,
+        code_theme: args.code_theme,
+        line_numbers: !args.no_line_numbers,
+        code_badge: !args.no_code_badge,
+        line_highlights: !args.no_line_highlights,
         bookmarks: !args.no_bookmarks,
     };
     let meta = postprocess::Meta {
@@ -204,9 +253,10 @@ async fn render_url(
         .filter(|b| matches!(b, extract::Block::Table(_)))
         .count();
     eprintln!(
-        "[pdf] {} sayfası, {} tema, {} blok, {tables} tablo, {} görsel...",
+        "[pdf] {} sayfası, {} tema, {} kod paleti, {} blok, {tables} tablo, {} görsel...",
         opts.page.name(),
         opts.theme.name(),
+        opts.code_theme.name(),
         article.blocks.len(),
         article.images.len()
     );
@@ -221,13 +271,23 @@ async fn render_url(
         );
     }
     eprintln!(
-        "[meta] {} yer imi, dil {}{}",
+        "[meta] {} yer imi, dil {}{}{}{}",
         rendered.bookmarks,
         meta.language,
         if meta.author.is_empty() {
             String::new()
         } else {
             format!(", yazar {}", meta.author)
+        },
+        if rendered.code_splits == 0 {
+            String::new()
+        } else {
+            format!(", {} kod bloğu sayfaya bölündü", rendered.code_splits)
+        },
+        if rendered.highlighted_lines == 0 {
+            String::new()
+        } else {
+            format!(", {} vurgulu kod satırı", rendered.highlighted_lines)
         }
     );
     Ok(rendered.bytes)
@@ -247,9 +307,15 @@ mod tests {
             no_images: false,
             page_size: pdf::PageSize::A4,
             theme: pdf::Theme::Light,
+            code_theme: pdf::CodeTheme::Auto,
+            no_line_numbers: false,
+            no_code_badge: false,
+            no_line_highlights: false,
             font_size: 11,
             author: None,
             lang: "tr".to_string(),
+            tr: false,
+            target_lang: "tr".to_string(),
             no_bookmarks: false,
             refresh_filters: false,
             install: false,
@@ -289,6 +355,10 @@ mod tests {
             embed_images: !args.no_images,
             page: args.page_size,
             theme: args.theme,
+            code_theme: args.code_theme,
+            line_numbers: !args.no_line_numbers,
+            code_badge: !args.no_code_badge,
+            line_highlights: !args.no_line_highlights,
             bookmarks: !args.no_bookmarks,
         }
     }
@@ -319,6 +389,23 @@ mod tests {
     }
 
     #[test]
+    fn clap_parses_translate_flags() {
+        let a = Args::parse_from([
+            "snappdf",
+            "https://example.com",
+            "--tr",
+            "--target-lang",
+            "en",
+        ]);
+        assert!(a.tr);
+        assert_eq!(a.target_lang, "en");
+
+        let d = Args::parse_from(["snappdf", "https://example.com"]);
+        assert!(!d.tr);
+        assert_eq!(d.target_lang, "tr");
+    }
+
+    #[test]
     fn clap_defaults_keep_a4_light_and_bookmarks() {
         let a = Args::parse_from(["snappdf", "https://example.com"]);
         assert_eq!(a.page_size, pdf::PageSize::A4);
@@ -327,6 +414,45 @@ mod tests {
         assert_eq!(a.lang, "tr");
         assert!(a.author.is_none());
         assert_eq!(a.font_size, 11);
+    }
+
+    #[test]
+    fn clap_parses_code_block_options() {
+        let a = Args::parse_from([
+            "snappdf",
+            "https://example.com",
+            "--code-theme",
+            "monokai",
+            "--no-line-numbers",
+            "--no-code-badge",
+        ]);
+        assert_eq!(a.code_theme, pdf::CodeTheme::Monokai);
+        assert!(a.no_line_numbers);
+        assert!(a.no_code_badge);
+        let o = pdf_options_from(&a);
+        assert_eq!(o.code_theme, pdf::CodeTheme::Monokai);
+        assert!(!o.line_numbers);
+        assert!(!o.code_badge);
+    }
+
+    #[test]
+    fn code_block_defaults_are_enabled() {
+        let a = Args::parse_from(["snappdf", "https://example.com"]);
+        assert_eq!(a.code_theme, pdf::CodeTheme::Auto);
+        assert!(!a.no_line_numbers);
+        assert!(!a.no_code_badge);
+        let o = pdf_options_from(&a);
+        assert_eq!(o.code_theme, pdf::CodeTheme::Auto);
+        assert!(o.line_numbers);
+        assert!(o.code_badge);
+    }
+
+    #[test]
+    fn clap_rejects_unknown_code_theme() {
+        assert!(Args::try_parse_from(["snappdf", "https://a.com", "--code-theme", "neon"]).is_err());
+        assert!(parse_code_theme("solarized-dark").is_ok());
+        assert!(parse_code_theme("Sepia").is_ok());
+        assert!(parse_code_theme("auto").is_ok());
     }
 
     #[test]
@@ -461,11 +587,31 @@ mod tests {
            diye birkaç cümle daha ekliyoruz ki içerik çıkarımı makale gövdesini
            seçsin ve pipeline tamamen çalışsın.</p>
         <ul><li>madde bir</li><li>madde iki</li></ul>
+        <pre class="language-rust"><code>fn main() {
+    // uçtan uca: uzun satır kutu içinde sarmalanır
+    let toplam = birinci_deger + ikinci_deger + ucuncu_deger + dorduncu_deger + besinci_deger + altinci_deger + yedinci_deger;
+}</code></pre>
         <blockquote>alıntı bloğu</blockquote>
         <hr>
         <p>Son paragraf burada.</p>
       </article>
     </body></html>"#;
+
+    /// PDF sayfalarının içerik akışlarını (sıkıştırmayı açarak) birleştirir.
+    fn content_streams(bytes: &[u8]) -> String {
+        let doc = lopdf::Document::load_mem(bytes).expect("üretilen PDF okunamadı");
+        let mut out = String::new();
+        for page_id in doc.get_pages().values() {
+            for content_id in doc.get_page_contents(*page_id) {
+                let stream = doc.get_object(content_id).unwrap().as_stream().unwrap();
+                match stream.decompressed_content() {
+                    Ok(content) => out.push_str(&String::from_utf8_lossy(&content)),
+                    Err(_) => out.push_str(&String::from_utf8_lossy(&stream.content)),
+                }
+            }
+        }
+        out
+    }
 
     #[tokio::test]
     async fn render_url_end_to_end_produces_pdf() {
@@ -483,6 +629,27 @@ mod tests {
             .unwrap();
         assert!(bytes.starts_with(b"%PDF"));
         assert!(bytes.len() > 1000);
+
+        // Kod bloğu uçtan uca: kutu zemini, söz dizimi renkleri ve satır
+        // numarası/rozet rengi gerçek boru hattından geçip PDF'e yazılmalı.
+        let text = content_streams(&bytes);
+        assert!(
+            text.contains("% snappdf:kod-kutusu"),
+            "kod kutusu zemini boyanmadı"
+        );
+        // Dolgu operatörü dört ondalıkla yazılır (GitHub Light zemini).
+        assert!(
+            text.contains("0.9647 0.9725 0.9804 rg"),
+            "kutunun dolgu rengi yok"
+        );
+        assert!(
+            text.contains("0.81 0.13 0.18 rg"),
+            "anahtar sözcük rengi yok"
+        );
+        assert!(
+            text.contains("0.49 0.52 0.56 rg"),
+            "satır numarası/rozet rengi yok"
+        );
     }
 
     #[tokio::test]

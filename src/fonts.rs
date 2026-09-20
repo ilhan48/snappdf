@@ -230,6 +230,32 @@ mod tests {
         text.chars().collect()
     }
 
+    /// PDF katmanının sabit metinlerde bastığı özel karakterler: madde imi,
+    /// ayraç, kod kutusu ayıracı ve sarma işareti (bkz. `pdf.rs`). Hepsi gömülü
+    /// fontlarda bulunmalı — glifsiz karakter PDF'te boş kutu olarak görünür.
+    const UI_CHARS: &str = "ğĞüÜşŞıİöÖçÇ•―│«»";
+
+    #[test]
+    fn ui_characters_have_glyphs_in_both_fonts() {
+        for (label, data) in [
+            (
+                "sans",
+                include_bytes!("../assets/fonts/LiberationSans-Regular.ttf") as &[u8],
+            ),
+            (
+                "mono",
+                include_bytes!("../assets/fonts/LiberationMono-Regular.ttf") as &[u8],
+            ),
+        ] {
+            let face = ttf_parser::Face::parse(data, 0).expect("font çözümlenmeli");
+            let missing: Vec<char> = UI_CHARS
+                .chars()
+                .filter(|ch| face.glyph_index(*ch).is_none())
+                .collect();
+            assert!(missing.is_empty(), "{label}: glifsiz karakterler {missing:?}");
+        }
+    }
+
     #[test]
     fn subsetting_shrinks_the_font_a_lot() {
         let out = subset(SANS, &chars("Türkçe metin ğüşıöçİĞÜŞÖÇ")).unwrap();
@@ -243,7 +269,9 @@ mod tests {
 
     #[test]
     fn subset_font_is_parseable_and_keeps_requested_glyphs() {
-        let wanted = chars("Ağ çşıöİ0.ö");
+        // Kod kutusu işaretleri de (`│`, `»`) ve arayüz simgeleri (`•`, `―`)
+        // alt kümede eşlenmeli: alt kümeleme cmap'i yeniden kuruyor.
+        let wanted = chars("Ağ çşıöİ0.ö│«»•―");
         let out = subset(SANS, &wanted).unwrap();
         let face = ttf_parser::Face::parse(&out, 0).expect("alt küme ayrıştırılamadı");
         for ch in wanted {

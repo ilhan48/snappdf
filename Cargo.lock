@@ -2159,6 +2159,8 @@ dependencies = [
  "lopdf",
  "reqwest",
  "scraper",
+ "serde",
+ "serde_json",
  "subsetter",
  "thiserror 2.0.20",
  "tokio",
