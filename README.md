@@ -24,17 +24,27 @@ ikili, tamamen çevrimdışı çalışan PDF motoru.
      açılış sayfaları da böylece dönüştürülür.
    - Başlık, paragraf, **tablo**, kod bloğu, alıntı, **iç içe liste**, görsel,
      görsel altı açıklaması ve ayraçlar sırayla toplanır
+   - **Blok dışı metin kaybolmaz**: `<dl>/<dt>/<dd>`, `<details>/<summary>`,
+     `<figure>` ya da sınıfı tanınmayan `<div>` gibi yapıların kendi metni de
+     paragraf olarak basılır. Satır içi çocuklar (`span`, `a`, `code`) ayrı
+     paragrafa bölünmez, çift basılmaz.
+   - **Görsel kaynakları**: `srcset`/`picture` adayları arasından **en geniş**
+     olan seçilir (eskiden ilk aday alınıyordu ve bulanık görünüyordu);
+     tembel yükleyici yer tutucuları (`data:` URI, saydam GIF) atlanıp gerçek
+     `data-src` kullanılır. Görselin `alt`/`aria-label` metni saklanır.
 4. **Saf Rust PDF üretimi** (`genpdf`): seçilebilir sayfa boyutu (A4/A5/Letter/
    tablet), sayfa numaralı üstbilgi, okuma teması ve gömülü **Liberation**
    fontları → Türkçe karakterler (ğüşıöçİ) sorunsuz
-5. Görseller indirilip PDF'e gömülür; yüklenemeyenler zarif notla değiştirilir
+5. **Görseller önceden indirilir** (tek istemci, sınırlı eşzamanlılık) ve PDF'e
+   gömülür; yüklenemeyenler `alt` metniyle ya da kısa bir notla değiştirilir
 6. **Son işlem** (`lopdf`): meta veri (`/Info`, `/Lang`), başlıklardan üretilen
    **seviyeli yer imi ağacı** (içindekiler) ve tema zeminli sayfalar
 
 > **Fontlar yalnızca kullanılan karakterlerle gömülür.** Dört sans fontu
 > ~1.6 MB tutar ve tek başına PDF'in taban boyutunu belirlerdi. Metin artık
 > harf harf alt kümelenir (`subsetter` + `ttf-parser`): tipik bir yazıda
-> toplam font maliyeti ~140 KB'a iner.
+> toplam font maliyeti ~140 KB'a iner. BMP dışı karakterler için `cmap`
+> format 12 de yazılır; emoji ve matematik harfleri kaybolmaz.
 
 ## Çıktı kalitesi
 
@@ -49,8 +59,19 @@ ikili, tamamen çevrimdışı çalışan PDF motoru.
   (genpdf alfa kanallı görselleri reddeder). Görsel, doğal boyutundan
   büyütülmez ama metin sütununu asla taşmaz; sayfa yüksekliğine de sınır
   konur. İzleyici pikseli/ikon gibi 24 px altı görseller sessizce atlanır.
-  `srcset`, `data-src`, `data-lazy-src` gibi tembel yükleme kaynakları ve
-  içerik-tipi belirsizken **sihirli baytlar** (magic bytes) desteklenir.
+  - Tüm görseller render'dan **önce** indirilir: tek HTTP istemcisi, sınırlı
+    eşzamanlılık, aynı URL için tek istek. İsteklere `Referer` (kaynak sayfa)
+    ve `Accept: image/*` eklenir; sıcak korumalı CDN'ler (GitHub camo,
+    Cloudinary, imgur) görselleri bu yüzden artık reddetmez.
+  - **SVG** görseller gömülü fontlarla rasterize edilir (dokümantasyon
+    sitelerinin — Rust kitabı, MDN, Read the Docs — görselleri çoğunlukla
+    SVG'dir). Doğal ölçekte basılır, netlik için ~200 dpi rasterize edilir.
+  - **GIF** (ilk kare), PNG, JPEG ve WebP desteklenir; biçim içerik-tipinden
+    ya da **sihirli baytlardan** (magic bytes) çözülür.
+  - Gömülemeyen görsel sessizce kaybolmaz: varsa `alt` metni, yoksa
+    `[görsel indirilemedi: host/dosya.png]` notu basılır. Özet satırında kaç
+    görselin gömüldüğü/atlandığı/yüklenemediği ve kaç SVG'nin rasterize
+    edildiği yazılır.
 - **Listeler**: `<ol>`/`<ul>` ayrımı ve **iç içe seviyeler** korunur; maddeler
   askıda girintiyle (hanging indent) numaralanır.
 - **Kod blokları**: Bloglardaki gibi **ayrı bir kutu** içinde ve **söz dizimi
@@ -77,8 +98,10 @@ ikili, tamamen çevrimdışı çalışan PDF motoru.
     kalır.
   - **Satır numaraları**: Kod iki satırdan uzunsa her satır numaralanır ve
     numaralar `│` ayracıyla koddan ayrılır (`--no-line-numbers` ile kapatılır).
-    Numara sütunu metin akışının parçası olduğu için kopyalanan metinde de
-    görünür ve satırlar arasında kaymaz.
+    Numaralar PDF'te **gerçek metin** olarak basılır (satırlar kaymaz) ama
+    `ActualText` ile işaretlendiği için **seç-kopyala sırasında koda
+    karışmaz**: kopyaladığınız şey yalnızca kaynak koddur. Dil rozeti de
+    aynı şekilde kopyalanmaz.
   - **Uzun satırlar**: Satıra sığmayan kod satırı **görsel satırlara** bölünür;
     devam satırları numara yerine `│ »` işaretiyle girintilenir (genpdf'in
     kelime kaydırması kod girintisini bozardı). Sarım noktası ölçülerek
@@ -108,6 +131,9 @@ ikili, tamamen çevrimdışı çalışan PDF motoru.
   yüksekliğine konumlanır (`/XYZ` hedefi). PDF `/UseOutlines` ile açılır, yani
   tablette içindekiler paneli doğrudan gelir. Bir yazıda onlarca bölüm varsa
   ağaç iç içe görünür (Wikipedia örneğinde 55 yer imi, 4 seviye).
+  - Sayfa sonuna denk gelen bir başlık bir sonraki sayfaya taşınırsa yer imi
+    **basıldığı** sayfayı gösterir; aksi hâlde içindekilerdeki tıklama bir
+    sayfa geriye giderdi.
 - **Meta veri**: `/Title`, `/Author` (varsayılan: alan adı), `/CreationDate`,
   `/ModDate`, `/Lang` (Türkçe karakterler UTF-16BE yazılır) ve `/Producer: snappdf`.
 - **Tema**: `light` (varsayılan), `dark` (koyu zemin + açık metin) ve `sepia`.
@@ -122,9 +148,17 @@ ikili, tamamen çevrimdışı çalışan PDF motoru.
   zemini, çerçevesi, sol şeridin rengi, satır numaraları ve tüm simge renkleri
   bu paletten gelir.
 - **Görsel biçimleri**: PNG ve JPEG'e ek olarak **WebP** (kayıplı VP8, kayıpsız
-  VP8L ve alfa kanallı VP8X). Alfa kanallı WebP'ler kayıpsız çözülür (bunu
-  `image` 0.23 yapamaz, `image-webp` yapar), beyaz zemin üzerine bindirilir ve
-  PDF'e DeviceRGB olarak gömülür.
+  VP8L ve alfa kanallı VP8X), **GIF** (ilk kare) ve **SVG** (rasterize).
+  Alfa kanallı WebP'ler kayıpsız çözülür (bunu `image` 0.23 yapamaz,
+  `image-webp` yapar), beyaz zemin üzerine bindirilir ve PDF'e DeviceRGB
+  olarak gömülür. AVIF/HEIC gibi biçimler rasterize edilemediği için `alt`
+  metniyle birlikte atlanır.
+- **Metin her zaman seçilebilir/aranabilir**: fontlara `ToUnicode` eşlemesi
+  yazılır; kod blokları dâhil tüm metin kopyalanabilir. Kod yorumlarında ya da
+  çıktısında geçen ama gömülü fontlarda karşılığı olmayan karakterler (emoji,
+  CJK...) sessizce boş kutu olmak yerine özet satırında bildirilir:
+  `[font] 3 karakter basılamadı ...`. `✓`, `→`, `★` gibi yaygın işaretler için
+  DejaVu tabanlı **yedek aile** yalnızca gerektiğinde gömülür.
 
 ## Kurulum
 
@@ -185,8 +219,10 @@ Tablet + kalemle çalışmak için önerilen: `--page-size tablet --theme sepia 
 nota yer bırakır. Başlıklar yer imi ağacına işlenir, kod blokları çevrilmeden
 olduğu gibi basılır; uzun yazılarda bile kaybolmazsın.
 
-Çıktı dosyası adı host'tan türetilir: `developer.mozilla.org.pdf`,
-`www.rust-lang.org.pdf` ...
+Çıktı dosyası adı host + yolun son parçasından türetilir:
+`doc.rust-lang.org-hello.pdf`, `developer.mozilla.org-regular_expressions.pdf`.
+Kök adreslerde yalnızca host kullanılır (`www.rust-lang.org.pdf`). Böylece aynı
+sitedeki farklı sayfalar birbirinin üzerine yazmaz.
 
 Gereksinimler:
 - İlk çalıştırmada filtre listeleri (~2 MB) indirilir, 7 gün önbellekte tutulur
@@ -217,9 +253,11 @@ src/
 ├── lists.rs    EasyList/EasyPrivacy indirme + önbellek
 ├── blocker.rs  adblock-rust Engine sarmalayıcı (görsel süzme)
 ├── extract.rs  HTML -> makale blokları (tablo, iç içe liste, figure/figcaption)
-├── images.rs   Görsel indirme/çözümleme/ölçekleme/önbellek + alfa düzleştirme
-│               (PNG/JPEG/WebP; alfa kanallı WebP için image-webp)
+├── images.rs   Görsel hattı: eşzamanlı indirme (Referer/Accept), PNG/JPEG/
+│               WebP/GIF çözümleme, SVG rasterizasyonu, alfa düzleştirme ve
+│               PDF elemanına ölçekleme
 ├── fonts.rs    Font alt kümeleme: yalnızca kullanılan glifler + cmap sentezi
+│               (BMP için format 4, BMP dışı için format 12)
 ├── translate.rs  --tr: ücretsiz Google Translate ile makale çevirisi (kod
 │               blokları ve korumalı parçalar yer tutucuyla saklanır)
 ├── highlight.rs  Kod için bağımlılıksız söz dizimi renklendirme (dil ipucu,
@@ -233,15 +271,18 @@ src/
 └── install.rs  --install (PATH kurulumu) + --doctor (teşhis)
 ```
 
-Fontlar (`assets/fonts/`, SIL OFL 1.1) binary'ye gömülüdür: harici font
-dosyası gerekmez, çıktı her makinede aynı görünür. Gömmadan önce her font
-kullanılan karakterlere indirilir; alt kümeleme `cmap` tablosunu kaldırdığı
-(tarayıcı değil PDF için tasarlandığı) için gerekli tablo yeniden inşa edilir.
+Fontlar (`assets/fonts/`) binary'ye gömülüdür: harici font dosyası gerekmez,
+çıktı her makinede aynı görünür. Birincil aile **Liberation** (SIL OFL 1.1),
+gerektiğinde devreye giren yedek aile **DejaVu** (Bitstream Vera lisansı,
+`assets/fonts/LICENSE-DejaVu.txt`) ve SVG rasterizasyonu için kullanılan
+sistem-fontsuz bir font veritabanı içerir. Gömmadan önce her font kullanılan
+karakterlere indirilir; alt kümeleme `cmap` tablosunu kaldırdığı (tarayıcı değil
+PDF için tasarlandığı) için gerekli tablo yeniden inşa edilir.
 
 ## Testler
 
 ```bash
-cargo test        # 215 test
+cargo test        # 252 test
 cargo clippy      # uyarısız
 ```
 
@@ -274,4 +315,9 @@ Kayda değer testler:
   devam sayfasında üstbilginin "kod devamı" notuyla büyüdüğü uçtan uca
   doğrulanır.
 - **Yer imi ağacı**: seviyelerin iç içe yerleşimi, sayfa/konum hedefleri,
-  `/Count` değerleri ve meta veri doğrulanır.
+  `/Count` değerleri ve meta veri doğrulanır. Sayfaya sığmayıp taşınan
+  başlığın yer imi, başlığın **basıldığı** sayfayı gösterir.
+- **Kopyalanabilir metin**: üretilen PDF kendi küçük metin çıkarıcımızla
+  (`ToUnicode` + `ActualText`) okunur; gövde metni ve kod bulunur, satır
+  numaraları ve dil rozeti **bulunmaz**. Bu, kopyala-yapıştır akışının
+  gerçekten doğru metni verdiğini kanıtlar.

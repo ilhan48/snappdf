@@ -10,6 +10,9 @@ mod pdf;
 mod postprocess;
 mod translate;
 
+#[cfg(test)]
+mod testutil;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
@@ -226,9 +229,21 @@ async fn render_url(
         article.images.retain(|img| !blocked.contains(img));
         article
             .blocks
-            .retain(|b| !matches!(b, extract::Block::Image(u) if blocked.contains(u)));
+            .retain(|b| !matches!(b, extract::Block::Image { url, .. } if blocked.contains(url)));
         eprintln!("[temiz] {} izleyici/reklam görseli elendi", blocked.len());
     }
+
+    // Görseller render'dan *önce* indirilir: render aşaması ağa çıkmaz, PDF
+    // üretimi hiçbir zaman yavaşlayıp/başarısız olmaz.
+    let images = if args.no_images {
+        None
+    } else {
+        let loader = Arc::new(images::ImageLoader::new(client.clone(), url));
+        eprintln!("[görsel] {} adet indiriliyor...", article.images.len());
+        loader.prefetch(&article.images).await;
+        eprintln!("[görsel] indirme tamam ({} önbellek)", loader.cached());
+        Some(loader)
+    };
 
     let opts = pdf::PdfOptions {
         footer: !args.no_footer,
@@ -241,6 +256,7 @@ async fn render_url(
         code_badge: !args.no_code_badge,
         line_highlights: !args.no_line_highlights,
         bookmarks: !args.no_bookmarks,
+        images: images.clone(),
     };
     let meta = postprocess::Meta {
         title: article.title.clone(),
@@ -263,12 +279,8 @@ async fn render_url(
 
     let rendered = pdf::render_article(&article, &opts, &meta)?;
 
-    if !args.no_images {
-        let stats = images::take_stats();
-        eprintln!(
-            "[görsel] {} gömüldü, {} dekoratif atlandı, {} yüklenemedi",
-            stats.loaded, stats.skipped, stats.failed
-        );
+    if let Some(loader) = &images {
+        eprintln!("[görsel] {}", loader.stats());
     }
     eprintln!(
         "[meta] {} yer imi, dil {}{}{}{}",
@@ -290,6 +302,13 @@ async fn render_url(
             format!(", {} vurgulu kod satırı", rendered.highlighted_lines)
         }
     );
+    if !rendered.missing_glyphs.is_empty() {
+        eprintln!(
+            "[font] {} karakter basılamadı (gömülü fontlarda glifi yok): {}",
+            rendered.missing_glyphs.len(),
+            rendered.missing_glyphs.iter().take(12).collect::<String>()
+        );
+    }
     Ok(rendered.bytes)
 }
 
@@ -350,6 +369,7 @@ mod tests {
 
     fn pdf_options_from(args: &Args) -> pdf::PdfOptions {
         pdf::PdfOptions {
+            images: None,
             footer: !args.no_footer,
             font_size: args.font_size,
             embed_images: !args.no_images,
@@ -449,7 +469,9 @@ mod tests {
 
     #[test]
     fn clap_rejects_unknown_code_theme() {
-        assert!(Args::try_parse_from(["snappdf", "https://a.com", "--code-theme", "neon"]).is_err());
+        assert!(
+            Args::try_parse_from(["snappdf", "https://a.com", "--code-theme", "neon"]).is_err()
+        );
         assert!(parse_code_theme("solarized-dark").is_ok());
         assert!(parse_code_theme("Sepia").is_ok());
         assert!(parse_code_theme("auto").is_ok());
@@ -518,65 +540,10 @@ mod tests {
 
     // --- uçtan uca render_url testleri: yerel HTTP sunucusuyla ---
 
-    /// Testler için minik TCP HTTP sunucusu (fetch.rs'tekiyle aynı protokol).
-    struct TestServer {
-        addr: String,
-        handle: Option<std::thread::JoinHandle<()>>,
-        shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    }
+    use crate::testutil::TestServer;
 
-    impl TestServer {
-        fn start(responder: impl Fn(&str) -> String + Send + 'static) -> Self {
-            use std::io::Read;
-            use std::net::TcpListener;
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let addr = listener.local_addr().unwrap().to_string();
-            let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let sd = shutdown.clone();
-            let handle = std::thread::spawn(move || {
-                listener.set_nonblocking(true).unwrap();
-                while !sd.load(std::sync::atomic::Ordering::Relaxed) {
-                    match listener.accept() {
-                        Ok((mut stream, _)) => {
-                            let mut buf = [0u8; 4096];
-                            let n = stream.read(&mut buf).unwrap_or(0);
-                            let req = String::from_utf8_lossy(&buf[..n]).into_owned();
-                            let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
-                            let body = responder(&path);
-                            let resp = format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                                body.len(),
-                                body
-                            );
-                            let _ = std::io::Write::write_all(&mut stream, resp.as_bytes());
-                        }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(std::time::Duration::from_millis(10));
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
-            Self {
-                addr,
-                handle: Some(handle),
-                shutdown,
-            }
-        }
-
-        fn url(&self, path: &str) -> String {
-            format!("http://{}/{}", self.addr, path.trim_start_matches('/'))
-        }
-    }
-
-    impl Drop for TestServer {
-        fn drop(&mut self) {
-            self.shutdown
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            if let Some(h) = self.handle.take() {
-                let _ = h.join();
-            }
-        }
+    fn article_server() -> TestServer {
+        TestServer::start(|_| crate::testutil::Response::html(ARTICLE_HTML))
     }
 
     const ARTICLE_HTML: &str = r#"
@@ -615,7 +582,7 @@ mod tests {
 
     #[tokio::test]
     async fn render_url_end_to_end_produces_pdf() {
-        let server = TestServer::start(|_| ARTICLE_HTML.to_string());
+        let server = article_server();
         let client = fetch::build_client(fetch::DEFAULT_TIMEOUT).unwrap();
         let rules = "
 ||reklam.example^
@@ -656,10 +623,12 @@ mod tests {
     async fn render_url_filters_tracker_images_via_blocker() {
         // Görsel URL'si adblock kuralına çarparsa images listesinden düşmeli.
         let server = TestServer::start(|_| {
-            ARTICLE_HTML.replace(
-                "</article>",
-                r#"<img src="https://reklam.example/piksel.png">"#,
-            ) + "</article>"
+            crate::testutil::Response::html(
+                ARTICLE_HTML.replace(
+                    "</article>",
+                    r#"<img src="https://reklam.example/piksel.png">"#,
+                ) + "</article>",
+            )
         });
         let client = fetch::build_client(fetch::DEFAULT_TIMEOUT).unwrap();
         let blocker = Arc::new(blocker::Blocker::new("||reklam.example^\n".to_string()).unwrap());

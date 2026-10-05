@@ -100,10 +100,7 @@ impl Translator {
         if !resp.status().is_success() {
             bail!("çeviri servisi {} döndürdü", resp.status());
         }
-        let bytes = resp
-            .bytes()
-            .await
-            .context("çeviri yanıtı alınamadı")?;
+        let bytes = resp.bytes().await.context("çeviri yanıtı alınamadı")?;
         let body: DjResponse =
             serde_json::from_slice(&bytes).context("çeviri yanıtı çözümlenemedi")?;
         let out = body
@@ -387,7 +384,8 @@ mod tests {
 
     #[test]
     fn protect_and_restore_roundtrip() {
-        let text = "Rust'ı `cargo build` ile derleyin; bkz https://doc.rust-lang.org ve <em>vurgu</em>.";
+        let text =
+            "Rust'ı `cargo build` ile derleyin; bkz https://doc.rust-lang.org ve <em>vurgu</em>.";
         let (masked, parts) = protect(text);
         // `cargo build`, URL, <em>, </em> → 4 korumalı parça.
         assert_eq!(parts.len(), 4);

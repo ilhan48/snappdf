@@ -169,18 +169,27 @@ fn decoration_rect(decoration: &CodeDecoration, page: PageSize) -> HideRect {
 fn mark_hidden_text(content: &[u8], rects: &[HideRect]) -> (Vec<u8>, usize) {
     /// Konum eşleşmesinde hoş görülen sapma (pt).
     const TOLERANCE_PT: f64 = 0.8;
-    /// Boş `ActualText`: işaretli alan çıkarımda hiç metin üretmez.
-    const MARK_START: &[u8] = b"BDC\n/Span<</ActualText()>>\n";
+    /// Boş `ActualText` işareti. PDF operatörleri **operanlarından sonra**
+    /// gelir; bu yüzden özellik listesi ve `/Span` önce, `BDC` sonra yazılır:
+    /// `/Span<</ActualText()>> BDC <gösterim> EMC`. (Eskiden sıra tersti ve
+    /// PDF okuyucuları işareti yok sayıyordu; satır numaraları kopyalanan koda
+    /// karışıyordu.)
+    const MARK_START: &[u8] = b"/Span<</ActualText()>>\nBDC\n";
     const MARK_END: &[u8] = b"\nEMC\n";
 
     // (ofset, eklenecek baytlar, bu ofsetin önüne mi eklenir?)
     let mut inserts: Vec<(usize, &'static [u8], bool)> = Vec::new();
     let mut hidden = 0usize;
+    // Her süs alanının kalan glif bütçesi. Bir satır numarası sütunu `genpdf`
+    // tarafından boşlukta bölünüp birkaç gösterime ayrılır; hangi gösterimin
+    // süse ait olduğunu yalnızca konum söyler. Bütçe, alanın son karakterinden
+    // sonra koda geçilmesini garanti eder (aksi hâlde kodun ilk sözcüğü de
+    // gizlenebilirdi).
+    let mut budgets: Vec<usize> = rects.iter().map(|rect| rect.glyphs).collect();
 
     let mut numbers: Vec<f64> = Vec::new();
     let mut position = (0.0f64, 0.0f64);
     let mut in_text = false;
-    let mut first_show = false;
     // Bir metin gösteriminin operanı: (başlangıç, bitiş, glif sayısı).
     let mut pending: Option<(usize, usize, Option<usize>)> = None;
 
@@ -220,7 +229,7 @@ fn mark_hidden_text(content: &[u8], rects: &[HideRect]) -> (Vec<u8>, usize) {
             }
             b'>' => i += 1,
             b'<' => {
-                // Onaltılık dize: her glif iki basamaktır.
+                // Onaltılık dize (Identity-H'de her glif 2 bayt = 4 basamak).
                 let start = i;
                 i += 1;
                 let mut digits = 0usize;
@@ -231,7 +240,8 @@ fn mark_hidden_text(content: &[u8], rects: &[HideRect]) -> (Vec<u8>, usize) {
                     i += 1;
                 }
                 i = (i + 1).min(content.len());
-                pending = Some((start, i, Some(digits / 2)));
+                // Identity-H: her glif 2 bayt = 4 onaltılık basamak.
+                pending = Some((start, i, Some(digits / 4)));
             }
             b'[' => {
                 let start = i;
@@ -281,7 +291,7 @@ fn mark_hidden_text(content: &[u8], rects: &[HideRect]) -> (Vec<u8>, usize) {
                         _ => i += 1,
                     }
                 }
-                let glyphs = (digits != usize::MAX).then_some(digits / 2);
+                let glyphs = (digits != usize::MAX).then_some(digits / 4);
                 pending = Some((start, i, glyphs));
             }
             b'/' => {
@@ -296,7 +306,10 @@ fn mark_hidden_text(content: &[u8], rects: &[HideRect]) -> (Vec<u8>, usize) {
                 while i < content.len() && !is_content_delimiter(content[i]) {
                     i += 1;
                 }
-                if let Ok(number) = std::str::from_utf8(&content[start..i]).unwrap_or("").parse() {
+                if let Ok(number) = std::str::from_utf8(&content[start..i])
+                    .unwrap_or("")
+                    .parse()
+                {
                     numbers.push(number);
                 }
             }
@@ -309,35 +322,33 @@ fn mark_hidden_text(content: &[u8], rects: &[HideRect]) -> (Vec<u8>, usize) {
                     i += 1;
                 }
                 let operator = &content[start..i];
-                if in_text && first_show && matches!(operator, b"TJ" | b"Tj" | b"'" | b"\"") {
-                    if let Some((operand_start, _, glyphs)) = pending {
-                        if let Some(glyphs) = glyphs.filter(|glyphs| *glyphs > 0) {
-                            if let Some(rect) = rects.iter().find(|rect| {
-                                rect.glyphs == glyphs
-                                    && position.0 >= rect.x - TOLERANCE_PT
-                                    && position.0 <= rect.x + rect.width + TOLERANCE_PT
-                                    && position.1 >= rect.y - TOLERANCE_PT
-                                    && position.1 <= rect.y + rect.height + TOLERANCE_PT
-                            }) {
-                                let _ = rect;
-                                inserts.push((operand_start, MARK_START, true));
-                                inserts.push((i, MARK_END, false));
-                                hidden += 1;
-                            }
+                if in_text && matches!(operator, b"TJ" | b"Tj" | b"'" | b"\"") {
+                    if let Some((operand_start, _, Some(glyphs))) = pending {
+                        // Konumu bu alanın içinde ve bütçesine sığan ilk süs.
+                        let target = budgets.iter().enumerate().find_map(|(index, budget)| {
+                            let rect = rects[index];
+                            (glyphs > 0
+                                && glyphs <= *budget
+                                && position.0 >= rect.x - TOLERANCE_PT
+                                && position.0 <= rect.x + rect.width + TOLERANCE_PT
+                                && position.1 >= rect.y - TOLERANCE_PT
+                                && position.1 <= rect.y + rect.height + TOLERANCE_PT)
+                                .then_some(index)
+                        });
+                        if let Some(index) = target {
+                            budgets[index] -= glyphs;
+                            inserts.push((operand_start, MARK_START, true));
+                            inserts.push((i, MARK_END, false));
+                            hidden += 1;
                         }
-                        first_show = false;
                     }
                 }
                 match operator {
                     b"BT" => {
                         in_text = true;
-                        first_show = true;
                         position = (0.0, 0.0);
                     }
-                    b"ET" => {
-                        in_text = false;
-                        first_show = false;
-                    }
+                    b"ET" => in_text = false,
                     b"Td" | b"TD" if numbers.len() >= 2 => {
                         if !in_text {
                             position = (0.0, 0.0);
@@ -376,7 +387,8 @@ fn mark_hidden_text(content: &[u8], rects: &[HideRect]) -> (Vec<u8>, usize) {
 
 /// İçerik akışı belirteç ayracı (PDF sözdizimi).
 fn is_content_delimiter(byte: u8) -> bool {
-    byte.is_ascii_whitespace() || matches!(byte, b'/' | b'[' | b']' | b'<' | b'>' | b'(' | b')' | b'%')
+    byte.is_ascii_whitespace()
+        || matches!(byte, b'/' | b'[' | b']' | b'<' | b'>' | b'(' | b')' | b'%')
 }
 
 // ----------------------------------------------------------------- sıkıştırma
@@ -1200,6 +1212,121 @@ mod tests {
         }
     }
 
+    /// SVG görselleri doğal ölçülerinde (96 dpi varsayımıyla) basılmalı.
+    ///
+    /// Rasterize edilen görselin piksel sayısı doğal boyutun 2.1 katıdır;
+    /// taşıyıcı çözünürlük doğru bildirilmezse şemalar PDF'te iki kat büyük
+    /// çıkar (eski davranış).
+    #[test]
+    fn svg_image_is_placed_at_its_natural_size() {
+        const SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 90" width="200" height="90"><rect width="200" height="90" fill="#f6f8fa"/></svg>"##;
+        let url = "https://example.invalid/diagram.svg";
+        let loader = crate::images::loader_with(vec![(
+            url.to_string(),
+            SVG.as_bytes().to_vec(),
+            crate::images::Format::Svg,
+        )]);
+        let art = Article {
+            blocks: vec![Block::Image {
+                url: url.to_string(),
+                alt: "Örnek şema".into(),
+            }],
+            ..article()
+        };
+        let opts = PdfOptions {
+            images: Some(loader),
+            ..Default::default()
+        };
+        let bytes = crate::pdf::render_article(&art, &opts, &Meta::default())
+            .unwrap()
+            .bytes;
+        let stream = content_streams(&bytes);
+        // 200x90 CSS px = 150.0 x 67.5 pt (1 px = 0.75 pt).
+        assert!(
+            stream.contains("150.00 0.00 0.00 67.50"),
+            "görsel doğal ölçüsünde basılmadı:\n{stream}"
+        );
+        assert!(stream.contains(" Do"), "gömülü görsel çizilmedi");
+    }
+
+    /// Belgedeki gerçek metin — PDF okuyucuların seçtiği/aradığı metin.
+    fn page_text(bytes: &[u8]) -> String {
+        crate::testutil::extract_text(bytes)
+    }
+
+    /// Metin aranabilir/seçilebilir olmalı; kod blokları da kopyalanabilmeli
+    /// ama satır numarası sütunu kopyalanan metne karışmamalı.
+    #[test]
+    fn rendered_text_is_searchable_and_code_copies_without_the_gutter() {
+        let art = Article {
+            blocks: vec![
+                Block::Paragraph("Aranabilir paragraf metni burada.".into()),
+                Block::Code {
+                    text: "fn main() {\n    println!(\"merhaba\");\n}".into(),
+                    lang: Some("rust".into()),
+                    highlights: vec![],
+                },
+            ],
+            ..article()
+        };
+        let bytes = crate::pdf::render_article(&art, &PdfOptions::default(), &Meta::default())
+            .unwrap()
+            .bytes;
+        let text = page_text(&bytes);
+        assert!(
+            text.contains("Aranabilir paragraf metni"),
+            "gövde metni seçilemiyor: {text:?}"
+        );
+        assert!(text.contains("fn main()"), "kod seçilemiyor: {text:?}");
+        assert!(
+            text.contains("println!(\"merhaba\")"),
+            "kod satırı bozuk: {text:?}"
+        );
+        // Satır numarası/ayraç sütunu kopyalanan metne düşmemeli.
+        assert!(!text.contains("│"), "satır numarası kopyalanıyor: {text:?}");
+        assert!(!text.contains("»"), "sarma işareti kopyalanıyor: {text:?}");
+        assert!(
+            !text.contains("rust\n1"),
+            "dil rozeti kopyalanan metne karışıyor: {text:?}"
+        );
+    }
+
+    /// Gömülemeyen görsel sessizce kaybolmaz: alt metni (varsa) basılır.
+    #[test]
+    fn missing_image_falls_back_to_its_alt_text() {
+        let art = Article {
+            blocks: vec![Block::Image {
+                url: "https://example.invalid/yok.png".into(),
+                alt: "Akış şeması: giriş, işlem, çıkış".into(),
+            }],
+            ..article()
+        };
+        let loader = crate::images::loader_with(vec![]);
+        let opts = PdfOptions {
+            images: Some(loader),
+            ..Default::default()
+        };
+        let rendered = crate::pdf::render_article(&art, &opts, &Meta::default()).unwrap();
+        let text = page_text(&rendered.bytes);
+        for expected in ["Akış", "şeması", "giriş", "işlem", "çıkış"] {
+            assert!(text.contains(expected), "{expected:?} kayboldu: {text:?}");
+        }
+        // Alt metinsiz görselde kısa bir uyarı basılır.
+        let without_alt = Article {
+            blocks: vec![Block::Image {
+                url: "https://example.invalid/yok.png".into(),
+                alt: String::new(),
+            }],
+            ..article()
+        };
+        let rendered = crate::pdf::render_article(&without_alt, &opts, &Meta::default()).unwrap();
+        let text = page_text(&rendered.bytes);
+        assert!(
+            text.contains("example.invalid"),
+            "uyarı metni yok: {text:?}"
+        );
+    }
+
     /// Belgenin tüm sayfalarındaki metin operatörlerini döndürür.
     fn content_streams(bytes: &[u8]) -> String {
         let doc = Document::load_mem(bytes).unwrap();
@@ -1447,13 +1574,19 @@ mod tests {
         );
 
         // Sol şerit ayrı bir dolgudur ve kutunun sol yaylarını izler.
-        assert!(text.contains(&code_color_op(palette.accent)), "şerit rengi yok");
+        assert!(
+            text.contains(&code_color_op(palette.accent)),
+            "şerit rengi yok"
+        );
         let stripe = block
             .split(&code_color_op(palette.accent))
             .nth(1)
             .expect("şerit yok");
         assert!(
-            stripe[..stripe.find('f').unwrap_or(0)].matches(" c\n").count() >= 1,
+            stripe[..stripe.find('f').unwrap_or(0)]
+                .matches(" c\n")
+                .count()
+                >= 1,
             "şeridin sol köşeleri yuvarlatılmalı"
         );
     }
@@ -1591,11 +1724,7 @@ mod tests {
         let doc = Document::load_mem(&out).unwrap();
         let (_, image) = image_stream(&doc);
         assert_eq!(
-            image
-                .dict
-                .get(b"Filter")
-                .and_then(Object::as_name)
-                .unwrap(),
+            image.dict.get(b"Filter").and_then(Object::as_name).unwrap(),
             b"FlateDecode",
             "görsel akışı Flate ile sıkıştırılmalı"
         );
@@ -1605,7 +1734,11 @@ mod tests {
         let mut probe = image.clone();
         probe.dict.remove(b"Subtype");
         assert_eq!(probe.decompressed_content().unwrap(), pixels);
-        assert!(out.len() < before, "dosya küçülmeli: {before} -> {}", out.len());
+        assert!(
+            out.len() < before,
+            "dosya küçülmeli: {before} -> {}",
+            out.len()
+        );
     }
 
     #[test]
@@ -1631,7 +1764,10 @@ mod tests {
         assert!(band[0] + band[2] < box_x + box_w - 1.0, "{band:?}");
         assert!(band[1] > box_y, "{band:?} / {box_y}");
         assert!(band[1] + band[3] < box_y + box_h, "{band:?}");
-        assert!(band[3] > 2.0 && band[3] < box_h, "satır yüksekliği: {band:?}");
+        assert!(
+            band[3] > 2.0 && band[3] < box_h,
+            "satır yüksekliği: {band:?}"
+        );
 
         // Renk paletten gelmeli.
         let palette = Theme::Light.palette_with(CodeTheme::Auto).code;

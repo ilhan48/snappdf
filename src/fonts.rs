@@ -26,18 +26,25 @@ pub fn subset(data: &[u8], chars: &BTreeSet<char>) -> Result<Vec<u8>> {
     //    (.notdef) her alt kümede bulunur; ona düşen karakterler yazılmaz.
     let mut remapper = subsetter::GlyphRemapper::new();
     // (karakter kodu, alt kümedeki glif numarası)
-    let mut mapping: Vec<(u16, u16)> = Vec::with_capacity(chars.len());
+    let mut bmp: Vec<(u16, u16)> = Vec::with_capacity(chars.len());
+    let mut astral: Vec<(u32, u16)> = Vec::new();
     for &ch in chars {
-        // Format 4 `cmap` yalnızca BMP'yi kapsar.
         let code = ch as u32;
-        if code == 0 || code > 0xFFFF || code == 0xFFFF {
+        if code == 0 || code == 0xFFFF {
             continue;
         }
-        if let Some(glyph) = face.glyph_index(ch) {
-            let mapped = remapper.remap(glyph.0);
-            if mapped != 0 {
-                mapping.push((code as u16, mapped));
-            }
+        let Some(glyph) = face.glyph_index(ch) else {
+            continue;
+        };
+        let mapped = remapper.remap(glyph.0);
+        if mapped == 0 {
+            continue;
+        }
+        // Format 4 yalnızca BMP'yi kapsar; BMP dışı karakterler format 12'ye.
+        if code <= 0xFFFF {
+            bmp.push((code as u16, mapped));
+        } else {
+            astral.push((code, mapped));
         }
     }
 
@@ -47,28 +54,74 @@ pub fn subset(data: &[u8], chars: &BTreeSet<char>) -> Result<Vec<u8>> {
     let mut font = subsetter::subset(data, 0, &remapper).context("font alt kümeleme başarısız")?;
 
     // 3) Eksik `cmap` tablosunu yazıp sfnt tablo dizinine ekle.
-    let cmap = cmap_table(&mapping);
+    let cmap = cmap_table(&bmp, &astral);
     add_table(&mut font, b"cmap", &cmap)?;
 
     Ok(font)
 }
 
-/// Karakter→glif eşlemesi için `cmap` tablosu üretir. İki kodlama kaydı
-/// (Unicode BMP ve Windows BMP) aynı alt tabloyu gösterir; farklı okuyucular
-/// farklı kayıtları tercih eder.
-fn cmap_table(mapping: &[(u16, u16)]) -> Vec<u8> {
-    let subtable = cmap4_subtable(mapping);
-    // version(2) + numTables(2) + 2 * kayıt(8)
-    let header_len = 4 + 2 * 8;
-    let mut out = Vec::with_capacity(header_len + subtable.len());
+/// Karakter→glif eşlemesi için `cmap` tablosu üretir.
+///
+/// BMP için iki kodlama kaydı (Unicode BMP ve Windows BMP) aynı format 4 alt
+/// tablosunu gösterir; farklı okuyucular farklı kayıtları tercih eder. BMP dışı
+/// karakterler varsa format 12 alt tablosu da eklenir (Windows UCS-4 kaydı).
+fn cmap_table(bmp: &[(u16, u16)], astral: &[(u32, u16)]) -> Vec<u8> {
+    let sub4 = cmap4_subtable(bmp);
+    let sub12 = (!astral.is_empty()).then(|| cmap12_subtable(astral));
+    let count = 2 + usize::from(sub12.is_some());
+
+    // version(2) + numTables(2) + kayıtlar (8 baytlik)
+    let header_len = 4 + count * 8;
+    let extra = sub12.as_ref().map_or(0, Vec::len);
+    let mut out = Vec::with_capacity(header_len + sub4.len() + extra);
     out.extend_from_slice(&0u16.to_be_bytes());
-    out.extend_from_slice(&2u16.to_be_bytes());
+    out.extend_from_slice(&(count as u16).to_be_bytes());
     for (platform, encoding) in [(0u16, 3u16), (3, 1)] {
         out.extend_from_slice(&platform.to_be_bytes());
         out.extend_from_slice(&encoding.to_be_bytes());
         out.extend_from_slice(&(header_len as u32).to_be_bytes());
     }
-    out.extend_from_slice(&subtable);
+    if sub12.is_some() {
+        out.extend_from_slice(&3u16.to_be_bytes());
+        out.extend_from_slice(&10u16.to_be_bytes());
+        out.extend_from_slice(&((header_len + sub4.len()) as u32).to_be_bytes());
+    }
+    out.extend_from_slice(&sub4);
+    if let Some(sub12) = sub12 {
+        out.extend_from_slice(&sub12);
+    }
+    out
+}
+
+/// Format 12 alt tablosu: BMP dışı karakterler için kesintisiz gruplar
+/// `(startCharCode, endCharCode, startGlyphID)`.
+fn cmap12_subtable(astral: &[(u32, u16)]) -> Vec<u8> {
+    let mut groups: Vec<(u32, u32, u32)> = Vec::new();
+    for &(code, glyph) in astral {
+        // Önceki grubun devamı mı? (kod ve glif numarası birlikte artmalı.)
+        let continues = groups.last().is_some_and(|(start, end, start_glyph)| {
+            *end + 1 == code && *start_glyph + (code - *start) == u32::from(glyph)
+        });
+        if continues {
+            let (_, end, _) = groups.last_mut().expect("grup var");
+            *end = code;
+        } else {
+            groups.push((code, code, u32::from(glyph)));
+        }
+    }
+    // format(2) + reserved(2) + length(4) + language(4) + nGroups(4)
+    let length = 16 + groups.len() * 12;
+    let mut out = Vec::with_capacity(length);
+    out.extend_from_slice(&12u16.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes());
+    out.extend_from_slice(&(length as u32).to_be_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes());
+    out.extend_from_slice(&(groups.len() as u32).to_be_bytes());
+    for (start, end, start_glyph) in groups {
+        out.extend_from_slice(&start.to_be_bytes());
+        out.extend_from_slice(&end.to_be_bytes());
+        out.extend_from_slice(&start_glyph.to_be_bytes());
+    }
     out
 }
 
@@ -252,7 +305,10 @@ mod tests {
                 .chars()
                 .filter(|ch| face.glyph_index(*ch).is_none())
                 .collect();
-            assert!(missing.is_empty(), "{label}: glifsiz karakterler {missing:?}");
+            assert!(
+                missing.is_empty(),
+                "{label}: glifsiz karakterler {missing:?}"
+            );
         }
     }
 
@@ -452,7 +508,7 @@ mod tests {
 
     #[test]
     fn cmap_table_declares_two_unicode_records() {
-        let table = cmap_table(&[(0x0041, 1), (0x011F, 2)]);
+        let table = cmap_table(&[(0x0041, 1), (0x011F, 2)], &[]);
         assert_eq!(&table[0..2], &[0, 0]); // version
         assert_eq!(&table[2..4], &[0, 2]); // iki kayıt
                                            // İlk kayıt: platform 0, encoding 3, alt tablo uzaklığı (bayt 8-11).
@@ -504,5 +560,60 @@ mod tests {
         for expected in ["cmap", "glyf", "head", "hhea", "hmtx", "loca", "maxp"] {
             assert!(tags.contains(&expected.to_string()), "{expected} yok");
         }
+    }
+
+    #[test]
+    fn subset_keeps_bmp_characters_findable() {
+        let out = subset(SANS, &chars("Merhaba ğüşıöç")).unwrap();
+        let face = ttf_parser::Face::parse(&out, 0).expect("alt küme çözümlenmeli");
+        for ch in "Merhaba ğüşıöç".chars() {
+            assert!(face.glyph_index(ch).is_some(), "{ch:?} glifi kayboldu");
+        }
+    }
+
+    /// BMP dışı karakterler (emoji, matematik harfleri) format 12 olmadan
+    /// kaybolur ve PDF'te boş kutu olarak basılırdı.
+    #[test]
+    fn subset_keeps_non_bmp_characters_findable() {
+        // DejaVu emoji gliflerini taşıyor; Liberation'da yoklar.
+        const DEJAVU: &[u8] = include_bytes!("../assets/fonts/DejaVuSans.ttf");
+        let text = "Merhaba 😀 dünya";
+        let out = subset(DEJAVU, &chars(text)).unwrap();
+        let face = ttf_parser::Face::parse(&out, 0).expect("alt küme çözümlenmeli");
+        for ch in text.chars() {
+            assert!(
+                face.glyph_index(ch).is_some(),
+                "{ch:?} (U+{:04X}) glifi kayboldu",
+                ch as u32
+            );
+        }
+    }
+
+    #[test]
+    fn astral_characters_are_ignored_when_the_font_lacks_them() {
+        // DejaVu emoji glifi var ama CJK yok; eksik olan sessizce atlanır ve
+        // hata vermez (çıkarım katmanı bunları "basılamayan" olarak raporlar).
+        let out = subset(SANS, &chars("Merhaba 字")).unwrap();
+        let face = ttf_parser::Face::parse(&out, 0).expect("alt küme çözümlenmeli");
+        assert!(face.glyph_index('字').is_none());
+        assert!(face.glyph_index('M').is_some());
+    }
+
+    #[test]
+    fn cmap12_groups_are_merged_when_contiguous() {
+        // Aralıklar bitişik ve glifleri de ardışık ise tek grup yazılır.
+        let table = cmap12_subtable(&[(0x1F600, 10), (0x1F601, 11), (0x1F680, 20)]);
+        let n_groups = u32::from_be_bytes(table[12..16].try_into().unwrap());
+        assert_eq!(n_groups, 2);
+        let length = u32::from_be_bytes(table[4..8].try_into().unwrap()) as usize;
+        assert_eq!(length, table.len(), "length alanı tablo boyutuyla uyuşmalı");
+    }
+
+    #[test]
+    fn cmap_has_no_format12_when_everything_is_bmp() {
+        let table = cmap_table(&[(u16::from(b'A'), 1)], &[]);
+        // 3 kayıt olmamalı: yalnızca (0,3) ve (3,1).
+        let count = u16::from_be_bytes(table[2..4].try_into().unwrap());
+        assert_eq!(count, 2);
     }
 }

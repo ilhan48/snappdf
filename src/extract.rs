@@ -60,7 +60,15 @@ pub enum Block {
         depth: u8,
     },
     Table(Table),
-    Image(String),
+    /// Görsel. `alt` metni, görsel PDF'e gömülemediğinde (veya boyutu
+    /// gereksiz küçük olduğunda) okunabilir bir açıklama olarak basılır; bu
+    /// sayede eksik görsel sessizce kaybolmaz.
+    Image {
+        /// Mutlak görsel URL'i.
+        url: String,
+        /// Görselin alternatif metni (`alt`/`aria-label`/`title`), boş olabilir.
+        alt: String,
+    },
     Divider,
 }
 
@@ -511,39 +519,159 @@ fn collect_lines(node: NodeRef<Node>, lines: &mut Vec<String>, cur: &mut String)
 
 /// Elemandaki ilk anlamlı görsel kaynağını toplar.
 /// Elemanın kendisi <img> olabilir ya da içinde bir <img> bulunabilir.
-fn img_in(el: ElementRef, images: &mut Vec<String>, base: &str) -> Option<String> {
-    let img_sel = Selector::parse("img").expect("geçerli seçici");
+fn img_in(el: ElementRef, images: &mut Vec<String>, base: &str) -> Option<(String, String)> {
     let img = if el.value().name() == "img" {
         el
     } else {
-        el.select(&img_sel).next()?
+        el.select(&img_selector()).next()?
     };
-    let v = img.value();
-    let raw = [
-        "src",
-        "data-src",
-        "data-lazy-src",
-        "data-original",
-        "data-url",
-    ]
-    .iter()
-    .find_map(|attr| v.attr(attr).map(str::trim).filter(|s| !s.is_empty()))
-    .map(str::to_string)
-    .or_else(|| srcset_first_url(v.attr("srcset").or_else(|| v.attr("data-srcset"))))?;
-    if raw.starts_with("data:") {
-        return None;
-    }
+    let alt = alt_text(img);
+
+    let raw = best_source(img)
+        .or_else(|| picture_source(img))
+        .or_else(|| best_srcset(img))?;
     let abs = crate::fetch::absolute_url(base, &raw)?;
     if !images.contains(&abs) {
         images.push(abs.clone());
     }
-    Some(abs)
+    Some((abs, alt))
 }
 
-/// srcset'ten ilk URL'yi seçer: "a.png 1x, b.png 2x" -> "a.png".
-fn srcset_first_url(srcset: Option<&str>) -> Option<String> {
-    let first = srcset?.split(',').next()?.split_whitespace().next()?;
-    (!first.is_empty()).then(|| first.to_string())
+/// Kaynak (lazy-load) öznitelikleri. Sıra önemlidir: gerçek `src` varsa o
+/// kullanılır; yoksa tembel yükleyicilerin yazdığı yerine geçilir.
+const SOURCE_ATTRS: &[&str] = &[
+    "src",
+    "data-src",
+    "data-lazy-src",
+    "data-original",
+    "data-original-src",
+    "data-url",
+    "data-hi-res-src",
+    "data-full-src",
+];
+
+/// `srcset` taşıyan öznitelikler (tembel yükleyiciler ayrıca `data-srcset`
+/// kullanır).
+const SRCSET_ATTRS: &[&str] = &[
+    "srcset",
+    "data-srcset",
+    "data-lazy-srcset",
+    "data-original-set",
+];
+
+/// `srcset` içinden seçilecek en geniş adayın piksel sınırı. Daha geniş
+/// adaylar PDF'i gereksiz büyütür (3x telefon ekranı görselleri).
+const MAX_SRCSET_WIDTH: u32 = 2400;
+
+/// Bir `<img>` için ham kaynak URL'si çözer (tembel yükleyici yer tutucuları
+/// atlanır).
+fn best_source(img: ElementRef) -> Option<String> {
+    let value = img.value();
+    SOURCE_ATTRS
+        .iter()
+        .filter_map(|attr| value.attr(attr))
+        .map(str::trim)
+        .find(|raw| !raw.is_empty() && !is_placeholder_source(raw))
+        .map(str::to_string)
+}
+
+/// Tembel yükleyici yer tutucusu: gömülü veri URI'si ya da saydam GIF. Bunlar
+/// "kaynak bulunamadı" demektir; `data-*` adayları taranmalıdır.
+fn is_placeholder_source(raw: &str) -> bool {
+    const SPACERS: &[&str] = &[
+        "blank.gif",
+        "spacer.gif",
+        "pixel.gif",
+        "1x1.gif",
+        "blank.png",
+        "placeholder.png",
+        "placeholder.svg",
+    ];
+    let lower = raw.to_ascii_lowercase();
+    if lower.starts_with("data:") || lower.starts_with("blob:") || lower.starts_with("about:") {
+        return true;
+    }
+    let file = lower.rsplit(['/', '?']).next().unwrap_or("");
+    SPACERS.contains(&file)
+}
+
+/// `<picture><source srcset=...>` adaylarından en uygunu. SVG dışındaki ilk
+/// raster aday seçilir (PDF'e gömülebilir), yoksa SVG'ye düşülür.
+fn picture_source(img: ElementRef) -> Option<String> {
+    let parent = img.parent_element()?;
+    if parent.value().name() != "picture" {
+        return None;
+    }
+    let source_sel = Selector::parse("source").ok()?;
+    let candidates: Vec<String> = parent
+        .select(&source_sel)
+        .flat_map(|source| {
+            SRCSET_ATTRS
+                .iter()
+                .filter_map(|attr| source.value().attr(attr))
+                .flat_map(srcset_candidates)
+                .map(|(_, _, url)| url)
+                .collect::<Vec<String>>()
+        })
+        .collect();
+    candidates
+        .iter()
+        .find(|url| !url.to_ascii_lowercase().ends_with(".svg"))
+        .or_else(|| candidates.first())
+        .cloned()
+}
+
+/// `srcset` (veya `data-srcset`) içinden en uygun aday.
+fn best_srcset(img: ElementRef) -> Option<String> {
+    SRCSET_ATTRS
+        .iter()
+        .filter_map(|attr| img.value().attr(attr))
+        .find_map(pick_srcset)
+}
+
+/// Bir `srcset` değerini adaylara ayırır: `(genişlik px, yoğunluk, url)`.
+/// Tanımsız tanımlayıcılar `None`'dır (`a.png` ya da `a.png 2x`).
+fn srcset_candidates(raw: &str) -> Vec<(Option<u32>, Option<f32>, String)> {
+    raw.split(',')
+        .filter_map(|part| {
+            let mut fields = part.split_whitespace();
+            let url = fields.next()?.trim();
+            if url.is_empty() || is_placeholder_source(url) {
+                return None;
+            }
+            let descriptor = fields.next().unwrap_or("").trim();
+            let width = descriptor.strip_suffix('w').and_then(|w| w.parse().ok());
+            let density = descriptor.strip_suffix('x').and_then(|d| d.parse().ok());
+            Some((width, density, url.to_string()))
+        })
+        .collect()
+}
+
+/// `srcset` içinden seçilecek aday: mümkün olan **en geniş** olan (üst sınırlı).
+///
+/// Eskiden ilk aday seçiliyordu; bu, `srcset` sırası küçükten büyüğe yazılan
+/// şablonlarda (WordPress, Hugo) bulanık görsele yol açıyordu.
+fn pick_srcset(raw: &str) -> Option<String> {
+    let candidates = srcset_candidates(raw);
+    let best = candidates
+        .iter()
+        .max_by_key(|(width, density, _)| match (width, density) {
+            (Some(w), _) => (*w).min(MAX_SRCSET_WIDTH),
+            (None, Some(d)) => (d * MAX_SRCSET_WIDTH as f32) as u32,
+            (None, None) => 0,
+        })?;
+    Some(best.2.clone())
+}
+
+/// Görselin okunabilir açıklaması: `alt`, yoksa `aria-label`, yoksa `title`.
+fn alt_text(el: ElementRef) -> String {
+    let value = el.value();
+    ["alt", "aria-label", "title"]
+        .iter()
+        .filter_map(|attr| value.attr(attr))
+        .map(clean_text)
+        .find(|text| !text.is_empty())
+        .unwrap_or_default()
 }
 
 /// Tabloyu çıkarır. İç içe tablolar yok sayılır.
@@ -704,11 +832,7 @@ impl<'a> Walker<'a> {
                     out.push(Block::Paragraph(text));
                 }
                 // Paragraf içine gömülü görseller (WordPress sık yapar).
-                for img in el.select(&img_selector()) {
-                    if let Some(url) = img_in(img, &mut self.images, self.base) {
-                        out.push(Block::Image(url));
-                    }
-                }
+                self.push_images(el, out);
             }
             "pre" => {
                 let (text, highlights) = code_body(el);
@@ -736,6 +860,8 @@ impl<'a> Walker<'a> {
                         depth,
                     });
                 }
+                // Öge içine gömülü görseller.
+                self.push_images(el, out);
             }
             "table" => {
                 if let Some(t) = table_from(el) {
@@ -756,15 +882,34 @@ impl<'a> Walker<'a> {
                 }
             }
             "img" => {
-                if let Some(url) = img_in(el, &mut self.images, self.base) {
-                    out.push(Block::Image(url));
+                if let Some((url, alt)) = img_in(el, &mut self.images, self.base) {
+                    out.push(Block::Image { url, alt });
                 }
             }
             "hr" => out.push(Block::Divider),
             _ => {
+                // Bilinmeyen kaplayıcının **kendi** metni: içindeki blokların
+                // metni hariç. `<div>metin <a>bağlantı</a> devam</div>` gibi
+                // belgelerde bu metin aksi hâlde tamamen kaybolurdu.
+                if !is_inline_tag(el.value().name()) {
+                    let text = flat_text(&inline_text(el));
+                    if !text.is_empty() {
+                        out.push(Block::Paragraph(text));
+                    }
+                }
                 for child in node.children() {
                     self.walk(child, out, depth);
                 }
+            }
+        }
+    }
+
+    /// Bir elemanın içindeki (gömülü) görselleri blok olarak ekler.
+    fn push_images(&mut self, el: ElementRef, out: &mut Vec<Block>) {
+        let img_sel = img_selector();
+        for img in el.select(&img_sel) {
+            if let Some((url, alt)) = img_in(img, &mut self.images, self.base) {
+                out.push(Block::Image { url, alt });
             }
         }
     }
@@ -808,6 +953,60 @@ impl<'a> Walker<'a> {
 
 fn img_selector() -> Selector {
     Selector::parse("img").expect("geçerli seçici")
+}
+
+/// Satır içi (inline) etiketler. Bunlar kendi başlarına paragraf üretmez;
+/// metinleri kapsayıcının "kendi metni"ne dâhildir. Bu sayede
+/// `<div>metin <span>vurgu</span> devam</div>` yapısı üç ayrı paragrafa
+/// bölünmez.
+const INLINE_TAGS: &[&str] = &[
+    "a", "abbr", "acronym", "b", "bdi", "bdo", "big", "cite", "code", "data", "del", "dfn", "em",
+    "font", "i", "ins", "kbd", "mark", "nobr", "output", "q", "rp", "rt", "ruby", "s", "samp",
+    "small", "span", "strike", "strong", "sub", "sup", "time", "tt", "u", "var", "wbr",
+];
+
+/// Etiket satır içi mi?
+fn is_inline_tag(name: &str) -> bool {
+    INLINE_TAGS.contains(&name)
+}
+
+/// Bir elemanın **kendi** metni: içindeki blok elemanların (ve kabuk
+/// alt ağaçlarının) metni hariç tutulur, satır sonları boşluğa indirgenir.
+///
+/// Bu, "hangi metin zaten ayrı bir blok olarak basılıyor" sorusunun tek
+/// noktadan cevabıdır: satır içi çocuklar (`span`, `a`, `code` ...) metne
+/// dâhildir, blok çocuklar (`p`, `li`, `dl` ...) kendi bloklarında basılır ve
+/// burada sayılmaz.
+fn inline_text(el: ElementRef) -> String {
+    let mut out = String::new();
+    for child in el.children() {
+        collect_inline(child, &mut out);
+    }
+    out
+}
+
+fn collect_inline(node: NodeRef<Node>, out: &mut String) {
+    if let Some(el) = ElementRef::wrap(node) {
+        if skip_element(&el) {
+            return;
+        }
+        if el.value().name() == "br" {
+            out.push(' ');
+            return;
+        }
+        // Blok elemanların içeriği ayrı bloklara dönüşür; burada sayılmaz.
+        if !is_inline_tag(el.value().name()) {
+            return;
+        }
+        for child in node.children() {
+            collect_inline(child, out);
+        }
+        return;
+    }
+    if let Some(text) = node.value().as_text() {
+        out.push_str(text);
+        out.push(' ');
+    }
 }
 
 /// Sınıf metninde tek başına geçtiğinde dil *sayılmayan* belirteçler.
@@ -990,7 +1189,11 @@ fn scan_node(node: NodeRef<Node>, scan: &mut CodeScan) {
             // Elemanın son satırı: sondaki boşluk/satır sonları sayılmaz, çünkü
             // `<span class="line hl">kod\n</span>` sonraki satırı kapsamaz.
             let inner = &scan.text[start_len..];
-            let last = start + inner.trim_end_matches(['\n', ' ', '\t', '\r']).matches('\n').count();
+            let last = start
+                + inner
+                    .trim_end_matches(['\n', ' ', '\t', '\r'])
+                    .matches('\n')
+                    .count();
             if is_mark {
                 scan.mark_spans.push((start_len, scan.text.len(), start));
             } else {
@@ -1068,7 +1271,9 @@ fn is_highlighted(el: ElementRef) -> bool {
     class.split_whitespace().any(|token| {
         let token = token.to_ascii_lowercase();
         HIGHLIGHT_TOKENS.contains(&token.as_str())
-            || HIGHLIGHT_SUFFIXES.iter().any(|suffix| token.ends_with(suffix))
+            || HIGHLIGHT_SUFFIXES
+                .iter()
+                .any(|suffix| token.ends_with(suffix))
     })
 }
 
@@ -1122,9 +1327,11 @@ fn range_marks(el: ElementRef, line_count: usize) -> BTreeSet<usize> {
 
 /// Bir elemanın sınıfında tam belirteç var mı?
 fn has_token(el: ElementRef, token: &str) -> bool {
-    el.value()
-        .attr("class")
-        .is_some_and(|class| class.split_whitespace().any(|t| t.eq_ignore_ascii_case(token)))
+    el.value().attr("class").is_some_and(|class| {
+        class
+            .split_whitespace()
+            .any(|t| t.eq_ignore_ascii_case(token))
+    })
 }
 
 /// `"2, 5-7"` -> `[(2, 2), (5, 7)]` (1 tabanlı, kapsayıcı).
@@ -1222,7 +1429,9 @@ fn language_from_tokens(raw: &str) -> Option<String> {
     let mut expect_language = false;
     for token in raw.split_whitespace() {
         let token = token
-            .trim_matches(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '+' | '#' | '-' | '_'))
+            .trim_matches(|c: char| {
+                !c.is_ascii_alphanumeric() && !matches!(c, '+' | '#' | '-' | '_')
+            })
             .to_ascii_lowercase();
         if token.is_empty() {
             continue;
@@ -1326,22 +1535,35 @@ fn trim_edges(blocks: &mut Vec<Block>) {
 }
 
 /// Art arda gelen görselleri tekilledir ve ikili tekrarları atar.
+///
+/// Aynı URL farklı `alt` metinleriyle geçse bile bir kez basılır; en açıklayıcı
+/// olan (daha uzunu) korunur.
 fn collapse_images(blocks: &mut Vec<Block>) {
-    let mut seen: Vec<String> = Vec::new();
-    let mut out: Vec<Block> = Vec::with_capacity(blocks.len());
-    for b in blocks.drain(..) {
-        match &b {
-            Block::Image(url) => {
-                if seen.contains(url) {
-                    continue;
-                }
-                seen.push(url.clone());
-                out.push(b);
+    // URL -> en açıklayıcı alt metni.
+    let mut alts: Vec<(String, String)> = Vec::new();
+    for block in blocks.iter() {
+        if let Block::Image { url, alt } = block {
+            match alts.iter_mut().find(|(existing, _)| existing == url) {
+                Some(slot) if alt.len() > slot.1.len() => slot.1.clone_from(alt),
+                Some(_) => {}
+                None => alts.push((url.clone(), alt.clone())),
             }
-            _ => out.push(b),
         }
     }
-    *blocks = out;
+    let mut emitted: Vec<String> = Vec::new();
+    blocks.retain_mut(|block| match block {
+        Block::Image { url, alt } => {
+            if emitted.contains(url) {
+                return false;
+            }
+            emitted.push(url.clone());
+            if let Some((_, best)) = alts.iter().find(|(existing, _)| existing == url) {
+                alt.clone_from(best);
+            }
+            true
+        }
+        _ => true,
+    });
 }
 
 /// Çıkarım hataları.
@@ -1469,10 +1691,9 @@ mod tests {
             .iter()
             .any(|b| matches!(b, Block::ListItem { .. })));
         assert!(art.blocks.iter().any(|b| matches!(b, Block::Divider)));
-        assert!(art
-            .blocks
-            .iter()
-            .any(|b| matches!(b, Block::Image(u) if u == "https://ornek.com/img/macera.png")));
+        assert!(art.blocks.iter().any(
+            |b| matches!(b, Block::Image { url, .. } if url == "https://ornek.com/img/macera.png")
+        ));
         assert_eq!(
             art.images,
             vec!["https://ornek.com/img/macera.png".to_string()]
@@ -1512,7 +1733,10 @@ mod tests {
                 r#"<div class="highlight highlight-source-python"><pre><code>x = 1</code></pre></div>"#,
                 Some("python"),
             ),
-            (r#"<pre class="wp-block-code"><code>genel</code></pre>"#, None),
+            (
+                r#"<pre class="wp-block-code"><code>genel</code></pre>"#,
+                None,
+            ),
             (r#"<pre><code>genel kod</code></pre>"#, None),
         ];
         for (html, expected) in cases.iter().copied() {
@@ -1578,9 +1802,7 @@ mod tests {
         );
         assert_eq!(marks, vec![1]);
 
-        let (_, marks) = code_of(
-            "<pre><code>birinci\n<mark>ikinci</mark>\nüçüncü</code></pre>",
-        );
+        let (_, marks) = code_of("<pre><code>birinci\n<mark>ikinci</mark>\nüçüncü</code></pre>");
         assert_eq!(marks, vec![1], "<mark> bulunduğu satırı işaretler");
     }
 
@@ -1621,7 +1843,10 @@ mod tests {
              // highlight-start\nlet c = 3;\nlet d = 4;\n// highlight-end\nlet e = 5;\
              </code></pre>",
         );
-        assert_eq!(text, "let a = 1;\nlet b = 2;\nlet c = 3;\nlet d = 4;\nlet e = 5;");
+        assert_eq!(
+            text,
+            "let a = 1;\nlet b = 2;\nlet c = 3;\nlet d = 4;\nlet e = 5;"
+        );
         assert_eq!(marks, vec![0, 2, 3]);
 
         // Yönerge olmayan yorumlar korunur.
@@ -1652,12 +1877,14 @@ mod tests {
         // Expressive Code/Starlight satır içi tek bir ifadeyi de `<mark>` ile
         // sarar; o durumda bütün satırı vurgulamak yanıltıcı olurdu.
         let (_, marks) = code_of("<pre><code>// <mark>ifade</mark> burada\nsatır iki</code></pre>");
-        assert!(marks.is_empty(), "ifade işareti satır vurgusu değil: {marks:?}");
+        assert!(
+            marks.is_empty(),
+            "ifade işareti satır vurgusu değil: {marks:?}"
+        );
 
         // Satırın tamamını kaplayan işaret vurgudur (baştaki girinti hoş görülür).
-        let (_, marks) = code_of(
-            "<pre><code>ilk\n  <mark>ikinci satır tamamen</mark>\nüçüncü</code></pre>",
-        );
+        let (_, marks) =
+            code_of("<pre><code>ilk\n  <mark>ikinci satır tamamen</mark>\nüçüncü</code></pre>");
         assert_eq!(marks, vec![1]);
     }
 
@@ -2148,7 +2375,7 @@ mod tests {
         let has_img = art
             .blocks
             .iter()
-            .any(|b| matches!(b, Block::Image(u) if u == "https://site.com/g1.png"));
+            .any(|b| matches!(b, Block::Image { url, .. } if url == "https://site.com/g1.png"));
         assert!(has_para && has_img, "{:?}", art.blocks);
     }
 
@@ -2158,7 +2385,7 @@ mod tests {
             r#"<figure><img src="/f.png"><figcaption>Şekil 1: örnek</figcaption></figure>"#,
         );
         let blocks = blocks_of(&html);
-        assert!(blocks.iter().any(|b| matches!(b, Block::Image(_))));
+        assert!(blocks.iter().any(|b| matches!(b, Block::Image { .. })));
         assert!(blocks
             .iter()
             .any(|b| matches!(b, Block::Caption(t) if t.contains("Şekil 1"))));
@@ -2171,9 +2398,15 @@ mod tests {
         let count = art
             .blocks
             .iter()
-            .filter(|b| matches!(b, Block::Image(_)))
+            .filter(|b| matches!(b, Block::Image { .. }))
             .count();
         assert_eq!(count, 1);
+    }
+
+    /// `img_in` çağrısının döndürdüğü mutlak URL.
+    fn image_url(html: &str, base: &str) -> Option<String> {
+        let frag = Html::parse_fragment(html);
+        img_in(frag.root_element(), &mut Vec::new(), base).map(|(url, _)| url)
     }
 
     #[test]
@@ -2181,16 +2414,82 @@ mod tests {
         let frag = Html::parse_fragment(r#"<img data-src="/lazy.png">"#);
         let mut images = Vec::new();
         let got = img_in(frag.root_element(), &mut images, "https://b.com/post");
-        assert_eq!(got.as_deref(), Some("https://b.com/lazy.png"));
+        assert_eq!(
+            got.map(|(url, _)| url).as_deref(),
+            Some("https://b.com/lazy.png")
+        );
         assert_eq!(images, vec!["https://b.com/lazy.png"]);
     }
 
     #[test]
-    fn srcset_is_used_when_src_missing() {
-        let frag = Html::parse_fragment(r#"<img srcset="/kucuk.png 1x, /buyuk.png 2x">"#);
-        let mut images = Vec::new();
-        let got = img_in(frag.root_element(), &mut images, "https://b.com/post");
-        assert_eq!(got.as_deref(), Some("https://b.com/kucuk.png"));
+    fn placeholder_src_falls_back_to_lazy_attributes() {
+        // Tembel yükleyiciler `src`ye saydam GIF/data URI koyar; gerçek kaynak
+        // `data-src`te durur. Eskiden görsel tamamen kayboluyordu.
+        let html =
+            r#"<img src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" data-src="/gercek.png">"#;
+        assert_eq!(
+            image_url(html, "https://b.com"),
+            Some("https://b.com/gercek.png".to_string())
+        );
+        assert_eq!(
+            image_url(
+                r#"<img src="/blank.gif" data-lazy-src="/gercek2.png">"#,
+                "https://b.com"
+            ),
+            Some("https://b.com/gercek2.png".to_string())
+        );
+    }
+
+    #[test]
+    fn srcset_picks_the_widest_candidate() {
+        // Küçükten büyüğe yazılan srcset'lerde ilk aday bulanık kalıyordu.
+        let html = r#"<img srcset="/kucuk.png 480w, /orta.png 1024w, /buyuk.png 1920w">"#;
+        assert_eq!(
+            image_url(html, "https://b.com"),
+            Some("https://b.com/buyuk.png".to_string())
+        );
+        // Yoğunluk tanımlayıcıları da sıralanır (büyük olan kazanır).
+        let html = r#"<img srcset="/kucuk.png 1x, /buyuk.png 3x">"#;
+        assert_eq!(
+            image_url(html, "https://b.com"),
+            Some("https://b.com/buyuk.png".to_string())
+        );
+    }
+
+    #[test]
+    fn srcset_is_capped_so_phone_dpr_images_do_not_blow_up_the_pdf() {
+        let html = r#"<img srcset="/a.png 800w, /dev.png 6000w">"#;
+        assert_eq!(
+            image_url(html, "https://b.com"),
+            Some("https://b.com/dev.png".to_string()),
+            "üst sınır yalnızca makulden büyük adayları eler"
+        );
+        // Üst sınır, telefon (3x) görsellerinin PDF'i şişirmesini engeller
+        // (değerin kendisi `MAX_SRCSET_WIDTH` sabitinde belgelenmiştir).
+    }
+
+    #[test]
+    fn picture_sources_are_used_when_img_has_no_usable_src() {
+        let html = r#"<picture>
+            <source srcset="/sekme.webp" type="image/webp">
+            <source srcset="/sekme.png" type="image/png">
+            <img src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" alt="sekil">
+        </picture>"#;
+        assert_eq!(
+            image_url(html, "https://b.com"),
+            Some("https://b.com/sekme.webp".to_string())
+        );
+    }
+
+    #[test]
+    fn alt_text_is_carried_with_the_image() {
+        let frag = Html::parse_fragment("<img src=\"/a.png\" alt=\"  Bir  tablo  \">");
+        let got = img_in(frag.root_element(), &mut Vec::new(), "https://b.com");
+        assert_eq!(got.map(|(_, alt)| alt).as_deref(), Some("Bir tablo"));
+        // alt yoksa aria-label, o da yoksa title kullanılır.
+        let frag = Html::parse_fragment(r#"<img src="/a.png" aria-label="çubuk">"#);
+        let got = img_in(frag.root_element(), &mut Vec::new(), "https://b.com");
+        assert_eq!(got.map(|(_, alt)| alt).as_deref(), Some("çubuk"));
     }
 
     #[test]
@@ -2202,8 +2501,86 @@ mod tests {
         let frag = Html::parse_fragment(r#"<img src="https://b.com/a.png">"#);
         let mut images = vec!["https://b.com/a.png".to_string()];
         let got = img_in(frag.root_element(), &mut images, "https://b.com");
-        assert_eq!(got.as_deref(), Some("https://b.com/a.png"));
+        assert_eq!(
+            got.map(|(url, _)| url).as_deref(),
+            Some("https://b.com/a.png")
+        );
         assert_eq!(images.len(), 1, "tekrar eklenmemeli");
+    }
+
+    #[test]
+    fn duplicate_images_keep_the_most_descriptive_alt_text() {
+        let html = article_html(
+            r#"<img src="/a.png"><p>ara</p><img src="/a.png" alt="ayrıntılı açıklama">"#,
+        );
+        let art = extract(&html, "https://site.com/y", &opts()).unwrap();
+        let alts: Vec<&str> = art
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Image { url, alt } if url == "https://site.com/a.png" => Some(alt.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(alts, vec!["ayrıntılı açıklama"]);
+    }
+
+    // --- blok dışı metin kaybı ---
+
+    #[test]
+    fn text_outside_known_blocks_is_not_dropped() {
+        // `<div>metin <a>bağlantı</a> devam</div>` yapısında metin kaybolurdu.
+        let html = article_html(
+            r#"<div>Kısa bir giriş <a href="/x">bağlantı metni</a> ve devam cümlesi.</div>"#,
+        );
+        let blocks = blocks_of(&html);
+        assert!(
+            blocks.iter().any(|b| matches!(b, Block::Paragraph(t)
+                if t.contains("Kısa bir giriş") && t.contains("bağlantı metni") && t.contains("devam"))),
+            "{blocks:?}"
+        );
+    }
+
+    #[test]
+    fn definition_lists_are_extracted_line_by_line() {
+        let html = article_html(r#"<dl><dt>Terim</dt><dd>Tanım metni burada.</dd></dl>"#);
+        let blocks = blocks_of(&html);
+        assert!(
+            blocks
+                .iter()
+                .any(|b| matches!(b, Block::Paragraph(t) if t == "Terim")),
+            "{blocks:?}"
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|b| matches!(b, Block::Paragraph(t) if t == "Tanım metni burada.")),
+            "{blocks:?}"
+        );
+    }
+
+    #[test]
+    fn inline_children_are_not_emitted_twice() {
+        // Satır içi çocuklar (span/b/code) ayrı paragraf üretmemeli.
+        let html = article_html(r#"<div>Bir <span>şu</span> <b>ve</b> <code>bu</code>.</div>"#);
+        let blocks = html_blocks(&html);
+        let paragraphs: Vec<&String> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        let counted = paragraphs
+            .iter()
+            .filter(|text| text.contains("şu") && text.contains("bu"))
+            .count();
+        assert_eq!(counted, 1, "{paragraphs:?}");
+    }
+
+    /// Testlerde kullanılan blok listesi çıkarımı (kısayol).
+    fn html_blocks(html: &str) -> Vec<Block> {
+        blocks_of(html)
     }
 
     #[test]

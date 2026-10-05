@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use genpdf::elements::{
     Break, BulletPoint, FrameCellDecorator, LinearLayout, Paragraph, TableLayout,
 };
-use genpdf::fonts::{FontData, FontFamily};
+use genpdf::fonts::{Font, FontData, FontFamily};
 use genpdf::render;
 use genpdf::style::{Color, Style};
 use genpdf::{
@@ -24,6 +24,20 @@ const MONO_REGULAR: &[u8] = include_bytes!("../assets/fonts/LiberationMono-Regul
 const MONO_BOLD: &[u8] = include_bytes!("../assets/fonts/LiberationMono-Bold.ttf");
 const MONO_ITALIC: &[u8] = include_bytes!("../assets/fonts/LiberationMono-Italic.ttf");
 const MONO_BOLD_ITALIC: &[u8] = include_bytes!("../assets/fonts/LiberationMono-BoldItalic.ttf");
+
+/// Yedek fontlar (DejaVu, Bitstream Vera lisansı — `assets/fonts/LICENSE-DejaVu.txt`).
+///
+/// Liberation Latin + Yunan + Kiril + kutu çizimleriyle sınırlıdır. Emoji,
+/// CJK, Arapça, `✓`/`✗` gibi işaretler ve Braille ise bu fontlarda **yoktur**;
+/// glifi bulunmayan karakter PDF'te boş kutu olarak basılır, yani kod çıktısı
+/// eksik görünür. DejaVu bu karakterlerin büyük kısmını karşılar; yedek aile
+/// yalnızca belgede gerçekten eksik glif varsa gömülür.
+pub const SANS_FALLBACK: &[u8] = include_bytes!("../assets/fonts/DejaVuSans.ttf");
+const SANS_FALLBACK_BOLD: &[u8] = include_bytes!("../assets/fonts/DejaVuSans-Bold.ttf");
+const SANS_FALLBACK_ITALIC: &[u8] = include_bytes!("../assets/fonts/DejaVuSans-Oblique.ttf");
+/// SVG rasterizasyonunda kullanılan mono yedek font. Kod metni hiçbir zaman
+/// kalın basılmadığı için kalın kesim ayrıca gömülmez.
+pub const MONO_FALLBACK: &[u8] = include_bytes!("../assets/fonts/DejaVuSansMono.ttf");
 
 // --- sayfa geometrisi ---
 /// Desteklenen sayfa boyutları. `Tablet`, 4:3 tablet ekranlarına oturan
@@ -144,7 +158,11 @@ impl Theme {
     /// Temanın paleti; yalnızca kod bloğu renkleri `code` temasından gelir.
     pub fn palette_with(self, code: CodeTheme) -> Palette {
         let (text, muted, background) = match self {
-            Self::Light => (Color::Rgb(0x1F, 0x24, 0x2B), Color::Rgb(0x6B, 0x72, 0x80), None),
+            Self::Light => (
+                Color::Rgb(0x1F, 0x24, 0x2B),
+                Color::Rgb(0x6B, 0x72, 0x80),
+                None,
+            ),
             Self::Dark => (
                 Color::Rgb(0xE4, 0xE7, 0xEB),
                 Color::Rgb(0x9A, 0xA4, 0xB2),
@@ -417,6 +435,10 @@ pub struct PdfOptions {
     pub line_highlights: bool,
     /// Başlıklardan PDF yer imi (içindekiler) üret
     pub bookmarks: bool,
+    /// Görsel kaynağı. Render sırasında yalnızca bu yükleyicinin önbelleği
+    /// kullanılır; ağ erişimi `ImageLoader::prefetch` ile önceden yapılır.
+    /// `None` ise görseller PDF'e gömülmez (testler/programatik kullanım).
+    pub images: Option<std::sync::Arc<crate::images::ImageLoader>>,
 }
 
 impl Default for PdfOptions {
@@ -432,6 +454,7 @@ impl Default for PdfOptions {
             code_badge: true,
             line_highlights: true,
             bookmarks: true,
+            images: None,
         }
     }
 }
@@ -447,23 +470,293 @@ fn font_from_bytes(data: &[u8], chars: &BTreeSet<char>) -> Result<FontData> {
     FontData::new(subset, None).context("Gömülü font çözümlenemedi")
 }
 
+/// Dört kesimi de kurar (regular/bold/italic/bold-italic).
+fn font_family(
+    regular: &[u8],
+    bold: &[u8],
+    italic: &[u8],
+    bold_italic: &[u8],
+    chars: &BTreeSet<char>,
+) -> Result<FontFamily<FontData>> {
+    Ok(FontFamily {
+        regular: font_from_bytes(regular, chars)?,
+        bold: font_from_bytes(bold, chars)?,
+        italic: font_from_bytes(italic, chars)?,
+        bold_italic: font_from_bytes(bold_italic, chars)?,
+    })
+}
+
 /// Sans font ailesini kurar (regular/bold/italic/bold-italic).
 pub fn sans_family(chars: &BTreeSet<char>) -> Result<FontFamily<FontData>> {
-    Ok(FontFamily {
-        regular: font_from_bytes(SANS_REGULAR, chars)?,
-        bold: font_from_bytes(SANS_BOLD, chars)?,
-        italic: font_from_bytes(SANS_ITALIC, chars)?,
-        bold_italic: font_from_bytes(SANS_BOLD_ITALIC, chars)?,
-    })
+    font_family(
+        SANS_REGULAR,
+        SANS_BOLD,
+        SANS_ITALIC,
+        SANS_BOLD_ITALIC,
+        chars,
+    )
 }
 
 /// Mono font ailesini kurar.
 pub fn mono_family(chars: &BTreeSet<char>) -> Result<FontFamily<FontData>> {
-    Ok(FontFamily {
-        regular: font_from_bytes(MONO_REGULAR, chars)?,
-        bold: font_from_bytes(MONO_BOLD, chars)?,
-        italic: font_from_bytes(MONO_ITALIC, chars)?,
-        bold_italic: font_from_bytes(MONO_BOLD_ITALIC, chars)?,
+    font_family(
+        MONO_REGULAR,
+        MONO_BOLD,
+        MONO_ITALIC,
+        MONO_BOLD_ITALIC,
+        chars,
+    )
+}
+
+/// DejaVu yedek ailesi (yalnızca ana fontta glifi olmayan karakterler için).
+fn sans_fallback_family(chars: &BTreeSet<char>) -> Result<FontFamily<FontData>> {
+    // DejaVu'da kalın italik kesim yok; kalın kesim bilinçli olarak kullanılır.
+    font_family(
+        SANS_FALLBACK,
+        SANS_FALLBACK_BOLD,
+        SANS_FALLBACK_ITALIC,
+        SANS_FALLBACK_BOLD,
+        chars,
+    )
+}
+
+/// DejaVu mono yedek ailesi. Kod kalın basılmadığı için tüm kesimler aynı
+/// dosyadan gelir (dört kesim genpdf `FontFamily`si için zorunludur).
+fn mono_fallback_family(chars: &BTreeSet<char>) -> Result<FontFamily<FontData>> {
+    font_family(
+        MONO_FALLBACK,
+        MONO_FALLBACK,
+        MONO_FALLBACK,
+        MONO_FALLBACK,
+        chars,
+    )
+}
+
+/// Belgedeki karakterler arasında ana fontta glifi **olmayan**lar.
+///
+/// Boşluk/kontrol karakterleri listeden çıkarılır: onlar için yedek font
+/// gömmek hem anlamsız hem de gereksiz maliyetlidir.
+fn needs_fallback(chars: &BTreeSet<char>, covered: &BTreeSet<char>) -> BTreeSet<char> {
+    chars
+        .difference(covered)
+        .filter(|ch| !ch.is_whitespace() && !ch.is_control() && !is_invisible(**ch))
+        .copied()
+        .collect()
+}
+
+/// Görünmez biçimlendirme karakteri mi? (sıfır genişlikli boşluk, yön
+/// işaretleri, yumuşak tire...)
+///
+/// Bunlar PDF'te zaten iz bırakmaz; "basılamayan karakter" uyarısına
+/// düşerlerse kullanıcıyı gereksiz yere meşgul ederler.
+fn is_invisible(ch: char) -> bool {
+    matches!(ch,
+        '\u{00AD}'            // yumuşak tire
+        | '\u{200B}'..='\u{200F}' // sıfır genişlikli ve yön işaretleri
+        | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{206F}' // kelime birleştirici, görünmez işleçler
+        | '\u{FEFF}'          // BOM / sıfır genişlikli bölünmez boşluk
+    )
+}
+
+/// `chars` kümesindeki hangi karakterlerin fontta glifi var?
+fn covered_chars(font: &[u8], chars: &BTreeSet<char>) -> BTreeSet<char> {
+    let Ok(face) = ttf_parser::Face::parse(font, 0) else {
+        return BTreeSet::new();
+    };
+    chars
+        .iter()
+        .filter(|ch| face.glyph_index(**ch).is_some())
+        .copied()
+        .collect()
+}
+
+/// Belgeye kaydedilmiş yazı tipi ailesi ve karakter kapsamı.
+///
+/// `TextFont::push` metni ikiye böler: ana fontta glifi olan karakterler ana
+/// fontla, olmayanlar yedek aileyle basılır. Böylece kutu çizim karakterleri
+/// (`├ │ └──`), Braille ve Arapça/Hebr kodu PDF'te boş kutu olarak değil,
+/// gerçek glifle görünür. Yedek aile yalnızca gerektiğinde gömülür.
+#[derive(Clone)]
+struct TextFont {
+    /// Ana aile (belgenin font önbelleğine kaydedilmiş).
+    family: FontFamily<Font>,
+    /// Yedek aile; `None` ise belgede yedek font gömülmemiştir.
+    fallback: Option<FontFamily<Font>>,
+    /// Ana fontta basılabilen karakterler.
+    covered: BTreeSet<char>,
+    /// Yedek fontta basılabilen karakterler.
+    fallback_covered: BTreeSet<char>,
+    /// Hiçbir fontta basılamayan karakterler (PDF'te boş kutu olarak çıkar).
+    missing: BTreeSet<char>,
+}
+
+impl TextFont {
+    /// Belgeye zaten kaydedilmiş bir aileyi sarmalar (yeniden gömülmez).
+    fn wrapping(
+        family: FontFamily<Font>,
+        covered: BTreeSet<char>,
+        fallback_data: Option<FontFamily<FontData>>,
+        fallback_covered: BTreeSet<char>,
+        missing: BTreeSet<char>,
+        doc: &mut Document,
+    ) -> Self {
+        let fallback = fallback_data.map(|data| doc.add_font_family(data));
+        Self {
+            family,
+            fallback,
+            covered,
+            fallback_covered,
+            missing,
+        }
+    }
+
+    /// Yeni bir aileyi kurup belgeye kaydeder.
+    fn register(
+        doc: &mut Document,
+        data: FontFamily<FontData>,
+        covered: BTreeSet<char>,
+        fallback_data: Option<FontFamily<FontData>>,
+        fallback_covered: BTreeSet<char>,
+        missing: BTreeSet<char>,
+    ) -> Self {
+        let family = doc.add_font_family(data);
+        Self {
+            family,
+            fallback: fallback_data.map(|data| doc.add_font_family(data)),
+            covered,
+            fallback_covered,
+            missing,
+        }
+    }
+
+    /// Hiçbir fontta basılamayan karakterler (kullanıcıya raporlanır).
+    fn missing(&self) -> &BTreeSet<char> {
+        &self.missing
+    }
+
+    /// Metni kapsama göre bölerek paragrafa basar.
+    ///
+    /// `style` ana aileyi içermelidir; yedek parçalar aynı punto/renk/efekt
+    /// ayarlarıyla yedek aileye bağlanır.
+    fn push(&self, paragraph: &mut Paragraph, text: &str, style: Style) {
+        let Some(fallback) = self.fallback else {
+            paragraph.push_styled(text.to_string(), style);
+            return;
+        };
+        for (segment, needs_fallback) in
+            split_by_coverage(text, &self.covered, &self.fallback_covered)
+        {
+            let style = if needs_fallback {
+                style.with_font_family(fallback)
+            } else {
+                style
+            };
+            paragraph.push_styled(segment, style);
+        }
+    }
+}
+
+/// Metni, ana fontta glifi olup olmamasına göre ikiye böler.
+///
+/// Boşluklar komşu parçaya yapışır: yedek fontun farklı genişliği, kod
+/// sarma hesabını kaydırmasın. Yedek fontta da glifi olmayan karakterler ana
+/// fontta bırakılır (PDF zaten boş kutu basar; en azından latin metinlerin
+/// ölçüsü bozulmaz).
+fn split_by_coverage(
+    text: &str,
+    covered: &BTreeSet<char>,
+    fallback_covered: &BTreeSet<char>,
+) -> Vec<(String, bool)> {
+    let mut parts: Vec<(String, bool)> = Vec::new();
+    for ch in text.chars() {
+        let needs_fallback =
+            !ch.is_whitespace() && !covered.contains(&ch) && fallback_covered.contains(&ch);
+        match parts.last_mut() {
+            Some((segment, flag)) if *flag == needs_fallback => segment.push(ch),
+            _ => parts.push((ch.to_string(), needs_fallback)),
+        }
+    }
+    parts
+}
+
+/// Belgenin yazı tipi paketi: gövde (sans) ve kod (mono) aileleri.
+struct FontPack {
+    /// Gövde yazı tipi.
+    sans: Rc<TextFont>,
+    /// Kod yazı tipi; yalnızca belgede kod bloğu varsa kurulur.
+    mono: Option<Rc<TextFont>>,
+}
+
+impl FontPack {
+    /// Hiçbir fontta glifi olmayan karakterler (PDF'te boş kutu olarak çıkar).
+    fn missing_glyphs(&self) -> BTreeSet<char> {
+        let mut missing = self.sans.missing().clone();
+        if let Some(mono) = &self.mono {
+            missing.extend(mono.missing().iter().copied());
+        }
+        missing
+    }
+}
+
+/// Metni verilen yazı tipiyle (gerekirse yedek fonta bölerek) paragrafa çevirir.
+fn styled_paragraph(font: &TextFont, text: &str, style: Style) -> Paragraph {
+    let mut paragraph = Paragraph::default();
+    font.push(&mut paragraph, text, style);
+    paragraph
+}
+
+/// Belge için yazı tiplerini kurar (gerekiyorsa yedek fontları da gömer).
+///
+/// Sans ailesi `Document::new` ile zaten kaydedildiği için yalnızca
+/// sarılır; mono ve yedek aileler burada eklenir.
+fn install_fonts(doc: &mut Document, chars: &BTreeSet<char>, mono: bool) -> Result<FontPack> {
+    let sans_covered = covered_chars(SANS_REGULAR, chars);
+    let sans_extra = needs_fallback(chars, &sans_covered);
+    let sans_fallback_chars = covered_chars(SANS_FALLBACK, &sans_extra);
+    let sans_missing = sans_extra
+        .difference(&sans_fallback_chars)
+        .copied()
+        .collect();
+    let sans_fallback = if sans_extra.is_empty() {
+        None
+    } else {
+        Some(sans_fallback_family(&sans_extra)?)
+    };
+    let sans = TextFont::wrapping(
+        doc.font_cache().default_font_family(),
+        sans_covered,
+        sans_fallback,
+        sans_fallback_chars,
+        sans_missing,
+        doc,
+    );
+
+    let mono = if mono {
+        let mono_covered = covered_chars(MONO_REGULAR, chars);
+        let extra = needs_fallback(chars, &mono_covered);
+        let fallback_chars = covered_chars(MONO_FALLBACK, &extra);
+        let missing = extra.difference(&fallback_chars).copied().collect();
+        let fallback = if extra.is_empty() {
+            None
+        } else {
+            Some(mono_fallback_family(&extra)?)
+        };
+        Some(Rc::new(TextFont::register(
+            doc,
+            mono_family(chars)?,
+            mono_covered,
+            fallback,
+            fallback_chars,
+            missing,
+        )))
+    } else {
+        None
+    };
+
+    Ok(FontPack {
+        sans: Rc::new(sans),
+        mono,
     })
 }
 
@@ -492,7 +785,10 @@ pub fn charset(article: &Article) -> BTreeSet<char> {
                     chars.extend(cell.chars());
                 }
             }
-            Block::Image(_) | Block::Divider => {}
+            // Görsel gömülemezse alt metni basılır; alt metnin glifleri de
+            // font alt kümesinde bulunmalı (yoksa not boş kutu olarak çıkardı).
+            Block::Image { alt, .. } => chars.extend(alt.chars()),
+            Block::Divider => {}
         }
     }
     chars
@@ -525,22 +821,25 @@ fn header_layout(
     title: String,
     palette: Palette,
     code_continues: bool,
+    font: &Rc<TextFont>,
 ) -> impl Fn(usize) -> LinearLayout + 'static {
+    let font = Rc::clone(font);
     move |page: usize| {
         let mut layout = LinearLayout::vertical();
-        let style = Style::new().with_font_size(8).with_color(palette.muted);
+        let style = Style::from(font.family)
+            .with_font_size(8)
+            .with_color(palette.muted);
         let mut row = TableLayout::new(vec![1, 1]);
         let left = if page <= 1 {
-            Paragraph::new("").styled(style)
+            styled_paragraph(&font, "", style)
         } else {
-            Paragraph::new(title.clone()).styled(style)
+            styled_paragraph(&font, &title, style)
         };
         let _ = row.push_row(vec![
             Box::new(left),
             Box::new(
-                Paragraph::new(header_text(page, code_continues))
-                    .aligned(Alignment::Right)
-                    .styled(style),
+                styled_paragraph(&font, &header_text(page, code_continues), style)
+                    .aligned(Alignment::Right),
             ),
         ]);
         layout.push(row);
@@ -721,9 +1020,12 @@ impl Element for BookmarkPoint {
         style: Style,
     ) -> Result<RenderResult, genpdf::error::Error> {
         let result = self.inner.render(context, area.clone(), style)?;
-        // Bir paragraf sayfaya sığmazsa sonraki sayfada yeniden render edilir;
-        // yer imi ise ilk (gerçek) konumu göstermelidir.
-        if !self.recorded {
+        // Bir başlık sayfaya sığmazsa `genpdf` onu sonraki sayfada yeniden
+        // render eder; **ilk satırı sığmayan** başlıkta hiçbir şey basılmadan
+        // sayfa değiştirilir. Yer imi ancak gerçekten basılan konumda
+        // kaydedilmelidir, yoksa içindekiler panelindeki tıklama bir sayfa
+        // geriye gider.
+        if !self.recorded && heading_placed(&result) {
             self.recorded = true;
             let mut state = self.state.borrow_mut();
             // Kök dikey yerleşimde her eleman bir öncekinin bittiği yerden
@@ -741,6 +1043,16 @@ impl Element for BookmarkPoint {
         }
         Ok(result)
     }
+}
+
+/// Bir başlık bu render çağrısında gerçekten basıldı mı?
+///
+/// `genpdf` bir paragrafı satır satır basar: en az bir satır sığdıysa
+/// `has_more` doğru olsa bile başlık **bu** sayfada başlamıştır ve yer imi
+/// buraya işaret etmelidir. Hiç satır sığmadıysa (`size.height == 0`) başlık
+/// bir sonraki sayfada basılacak; o sayfa kaydedilmelidir.
+fn heading_placed(result: &RenderResult) -> bool {
+    f64::from(result.size.height) > 0.0 || !result.has_more
 }
 
 /// Bir kod bloğu kutusunu sarar ve render sırasında kapladığı dikdörtgeni
@@ -796,6 +1108,7 @@ pub struct PdfJob {
     doc: Document,
     bookmarks_enabled: bool,
     state: Rc<RefCell<CaptureState>>,
+    fonts: Rc<FontPack>,
 }
 
 impl PdfJob {
@@ -805,6 +1118,7 @@ impl PdfJob {
             doc,
             bookmarks_enabled,
             state,
+            fonts: _,
         } = self;
         let mut buffer = Vec::new();
         doc.render(&mut buffer).context("PDF render başarısız")?;
@@ -832,6 +1146,8 @@ pub fn build_document(article: &Article, opts: &PdfOptions) -> Result<PdfJob> {
     doc.set_font_size(opts.font_size);
     doc.set_paper_size(Size::new(width_mm as f32, height_mm as f32));
 
+    let fonts = Rc::new(install_fonts(&mut doc, &chars, needs_mono(article))?);
+
     let state = Rc::new(RefCell::new(CaptureState::default()));
     let mut decorator = CapturingDecorator {
         margins: Margins::trbl(top, right, bottom, left),
@@ -845,37 +1161,31 @@ pub fn build_document(article: &Article, opts: &PdfOptions) -> Result<PdfJob> {
     if opts.footer {
         let title = article.title.clone();
         let header_state = Rc::clone(&state);
+        let sans_font = Rc::clone(&fonts.sans);
         decorator.header = Some(Box::new(move |page: usize| {
             // Önceki sayfa bir kod bloğunun ortasında bitmişse not eklenir.
             let continues = header_state.borrow().code_continues;
-            Box::new(header_layout(title.clone(), palette, continues)(page))
+            Box::new(header_layout(title.clone(), palette, continues, &sans_font)(page))
         }));
     }
     doc.set_page_decorator(decorator);
 
-    // Kod bloğu yoksa mono fontları hiç gömmeyiz: genpdf kullanılmayan fontları
-    // da gömer. (Alt kümeleme sonrası maliyet küçük ama gereksiz 4 font olur.)
-    let mono_style = if needs_mono(article) {
-        let family = doc.add_font_family(mono_family(&chars)?);
-        Some(
-            Style::from(family)
-                .with_font_size(9)
-                .with_color(palette.code.plain),
-        )
-    } else {
-        None
-    };
+    // Kod bloğu varsa mono yazı tipi `install_fonts` tarafından kuruldu.
+    let mono_style = fonts.mono.as_ref().map(|mono| {
+        Style::from(mono.family)
+            .with_font_size(9)
+            .with_color(palette.code.plain)
+    });
 
-    let body = Style::new().with_color(palette.text);
-    let title_style = Style::new()
+    let body = Style::from(fonts.sans.family).with_color(palette.text);
+    let title_style = Style::from(fonts.sans.family)
         .bold()
         .with_font_size(20)
         .with_color(palette.text);
 
     // Başlık (yer imi ağacının kökü)
-    let title_paragraph = Paragraph::new(&article.title)
-        .aligned(Alignment::Left)
-        .styled(title_style);
+    let title_paragraph =
+        styled_paragraph(&fonts.sans, &article.title, title_style).aligned(Alignment::Left);
     if opts.bookmarks {
         doc.push(BookmarkPoint::new(
             Box::new(title_paragraph),
@@ -894,13 +1204,24 @@ pub fn build_document(article: &Article, opts: &PdfOptions) -> Result<PdfJob> {
             Block::ListItem { .. } => {
                 let end = list_run_end(&article.blocks, i);
                 let run = &article.blocks[i..end];
-                doc.push(nested_list(run, body));
+                doc.push(nested_list(run, body, &fonts));
                 doc.push(Break::new(0.5));
                 i = end;
                 continue;
             }
             block => {
-                push_block(&mut doc, block, opts, palette, body, mono_style, &state);
+                push_block(
+                    &mut doc,
+                    block,
+                    &BlockContext {
+                        opts,
+                        palette,
+                        body,
+                        mono_style,
+                        state: &state,
+                        fonts: &fonts,
+                    },
+                );
             }
         }
         i += 1;
@@ -909,6 +1230,7 @@ pub fn build_document(article: &Article, opts: &PdfOptions) -> Result<PdfJob> {
         doc,
         bookmarks_enabled: opts.bookmarks,
         state,
+        fonts,
     })
 }
 
@@ -923,6 +1245,9 @@ pub struct Rendered {
     pub code_splits: usize,
     /// Vurgulu basılan kod satırı sayısı.
     pub highlighted_lines: usize,
+    /// Hiçbir gömülü fontta glifi bulunmayan karakterler (PDF'te boş kutu
+    /// olarak çıkar). Kullanıcıya "bu karakterler basılamadı" diye raporlanır.
+    pub missing_glyphs: BTreeSet<char>,
 }
 
 /// Makaleyi PDF baytlarına dönüştürür: yer imleri, meta veri ve tema zemini dâhil.
@@ -935,6 +1260,7 @@ pub fn render_article(
     // Kod kutularının dikdörtgenleri render sırasında yakalanır; dolgu zemin
     // sonradan (postprocess) sayfa akışının başına eklenir.
     let state = Rc::clone(&job.state);
+    let missing_glyphs = job.fonts.missing_glyphs();
     let (bytes, bookmarks) = job.render_with_bookmarks()?;
     let bookmark_count = bookmarks.len();
     // Kod kutusu dolgusu, kutu metinleriyle aynı paletten gelmeli.
@@ -962,19 +1288,40 @@ pub fn render_article(
         bookmarks: bookmark_count,
         code_splits,
         highlighted_lines,
+        missing_glyphs,
     })
 }
 
-/// Tek bir bloğu belgeye ekler (liste blokları çağıran tarafından gruplanır).
-fn push_block(
-    doc: &mut Document,
-    block: &Block,
-    opts: &PdfOptions,
+/// Blok basımı için ortak bağlam (parametre kalabalığını önler).
+struct BlockContext<'a> {
+    /// PDF seçenekleri (görsel yükleyici dâhil).
+    opts: &'a PdfOptions,
+    /// Tema paleti.
     palette: Palette,
+    /// Gövde metni stili.
     body: Style,
+    /// Kod stili (mono); kod bloğu yoksa `None`.
     mono_style: Option<Style>,
-    state: &Rc<RefCell<CaptureState>>,
-) {
+    /// Render sırasında dolan yakalama durumu.
+    state: &'a Rc<RefCell<CaptureState>>,
+    /// Yazı tipleri (yedek fontlarla birlikte).
+    fonts: &'a Rc<FontPack>,
+}
+
+/// Tek bir bloğu belgeye ekler (liste blokları çağıran tarafından gruplanır).
+fn push_block(doc: &mut Document, block: &Block, ctx: &BlockContext<'_>) {
+    let BlockContext {
+        opts,
+        palette,
+        body,
+        mono_style,
+        state,
+        fonts,
+    } = ctx;
+    let palette = *palette;
+    let body = *body;
+    let mono_style = *mono_style;
+    let sans = &fonts.sans;
     match block {
         Block::Heading { level, text } => {
             doc.push(Break::new(0.4));
@@ -984,11 +1331,11 @@ fn push_block(
                 3 => 13,
                 _ => 12,
             };
-            let style = Style::new()
+            let style = Style::from(sans.family)
                 .bold()
                 .with_font_size(size)
                 .with_color(palette.text);
-            let paragraph = Paragraph::new(text).styled(style);
+            let paragraph = styled_paragraph(sans, text, style);
             if opts.bookmarks {
                 doc.push(BookmarkPoint::new(
                     Box::new(paragraph),
@@ -1002,27 +1349,33 @@ fn push_block(
             doc.push(Break::new(0.2));
         }
         Block::Paragraph(text) => {
-            doc.push(Paragraph::new(text).styled(body));
+            doc.push(styled_paragraph(sans, text, body));
             doc.push(Break::new(0.35));
         }
         Block::Caption(text) => {
             doc.push(
-                Paragraph::new(text).aligned(Alignment::Center).styled(
-                    Style::new()
+                styled_paragraph(
+                    sans,
+                    text,
+                    Style::from(sans.family)
                         .italic()
                         .with_font_size(8)
                         .with_color(palette.muted),
-                ),
+                )
+                .aligned(Alignment::Center),
             );
             doc.push(Break::new(0.35));
         }
         Block::Quote(text) => {
             doc.push(
-                Paragraph::new(text)
-                    .styled(Style::new().italic().with_color(palette.muted))
-                    .padded(Margins::trbl(2, 0, 2, 6))
-                    .framed()
-                    .padded(Margins::trbl(2, 6, 2, 6)),
+                styled_paragraph(
+                    sans,
+                    text,
+                    Style::from(sans.family).italic().with_color(palette.muted),
+                )
+                .padded(Margins::trbl(2, 0, 2, 6))
+                .framed()
+                .padded(Margins::trbl(2, 6, 2, 6)),
             );
             doc.push(Break::new(0.35));
         }
@@ -1047,40 +1400,56 @@ fn push_block(
                     line_highlights: opts.line_highlights,
                 },
                 state,
+                fonts,
             );
             doc.push(CodeBoxCapture::new(Box::new(block), Rc::clone(state)));
             doc.push(Break::new(0.5));
         }
         Block::Table(table) => {
-            if let Some(el) = table_element(table, palette) {
+            if let Some(el) = table_element(table, palette, sans) {
                 doc.push(Break::new(0.2));
                 doc.push(el);
                 doc.push(Break::new(0.6));
             }
         }
-        Block::Image(url) => {
+        Block::Image { url, alt } => {
             // --no-images: sessizce atla, URL listesi basma.
             if !opts.embed_images {
                 return;
             }
-            match crate::images::load(
-                url,
-                opts.page.content_width_mm(),
-                opts.page.max_image_height_mm(),
-            ) {
+            let loader = opts.images.as_ref();
+            let outcome = match loader {
+                Some(loader) => loader.element(
+                    url,
+                    opts.page.content_width_mm(),
+                    opts.page.max_image_height_mm(),
+                ),
+                // Yükleyici yoksa (testler/programatik kullanım) ağa gidilmez.
+                None => ImageOutcome::Failed(crate::images::Failure::Network),
+            };
+            match outcome {
                 ImageOutcome::Loaded(img) => {
                     doc.push(*img);
                     doc.push(Break::new(0.4));
                 }
                 ImageOutcome::Skipped => {}
-                ImageOutcome::Failed => {
+                ImageOutcome::Failed(reason) => {
+                    // Görsel kaybolmasın: alt metin (yoksa kısa bir uyarı) basılır.
+                    let note = if alt.is_empty() {
+                        format!("[görsel {reason}: {}]", crate::images::host_label(url))
+                    } else {
+                        format!("[görsel: {alt}]")
+                    };
                     doc.push(
-                        Paragraph::new(format!("[görsel yüklenemedi: {url}]")).styled(
-                            Style::new()
+                        styled_paragraph(
+                            sans,
+                            &note,
+                            Style::from(sans.family)
                                 .italic()
                                 .with_font_size(8)
                                 .with_color(palette.muted),
-                        ),
+                        )
+                        .aligned(Alignment::Center),
                     );
                     doc.push(Break::new(0.2));
                 }
@@ -1088,9 +1457,14 @@ fn push_block(
         }
         Block::Divider => {
             doc.push(
-                Paragraph::new("―".repeat(30))
-                    .aligned(Alignment::Center)
-                    .styled(Style::new().with_color(palette.muted).with_font_size(8)),
+                styled_paragraph(
+                    sans,
+                    &"―".repeat(30),
+                    Style::from(sans.family)
+                        .with_color(palette.muted)
+                        .with_font_size(8),
+                )
+                .aligned(Alignment::Center),
             );
             doc.push(Break::new(0.5));
         }
@@ -1137,6 +1511,7 @@ fn code_block(
     highlights: &[usize],
     view: CodeBlockOptions,
     state: &Rc<RefCell<CaptureState>>,
+    fonts: &Rc<FontPack>,
 ) -> impl Element {
     let CodeBlockOptions {
         style,
@@ -1167,7 +1542,11 @@ fn code_block(
     let numbers = line_numbers && lines.len() >= 2;
     let badge = badge.then(|| lang.map(str::to_string)).flatten();
     let marks: BTreeSet<usize> = if line_highlights {
-        highlights.iter().copied().filter(|i| *i < lines.len()).collect()
+        highlights
+            .iter()
+            .copied()
+            .filter(|i| *i < lines.len())
+            .collect()
     } else {
         BTreeSet::new()
     };
@@ -1179,6 +1558,7 @@ fn code_block(
         numbers,
         style,
         palette,
+        font: fonts.mono.clone(),
         state: Rc::clone(state),
         planned: None,
         next: 0,
@@ -1220,6 +1600,8 @@ struct CodeBlock {
     style: Style,
     /// Kutu paleti.
     palette: CodePalette,
+    /// Mono yazı tipi (eksik glifler için yedek aileyle birlikte).
+    font: Option<Rc<TextFont>>,
     /// Taze sayfada kullanılabilir yükseklik için (taşıma kararı).
     state: Rc<RefCell<CaptureState>>,
     /// İlk render'da kurulan görsel satırlar (birim: mantıksal satır).
@@ -1252,6 +1634,14 @@ impl CodeBlock {
         f64::from(self.style.line_height(&context.font_cache))
     }
 
+    /// Yazı tipiyle (eksik glifler yedek aileye düşerek) metni paragrafa basar.
+    fn push(&self, paragraph: &mut Paragraph, text: &str, style: Style) {
+        match &self.font {
+            Some(font) => font.push(paragraph, text, style),
+            None => paragraph.push_styled(text.to_string(), style),
+        }
+    }
+
     /// Görsel satırları kurar: rozet, numara/ayraç ve sarılmış parçalar.
     fn plan(&self, context: &PdfContext, width_mm: f64) -> Vec<VisualLine> {
         let gutter_style = self.style.with_color(self.palette.gutter);
@@ -1261,8 +1651,9 @@ impl CodeBlock {
         if let Some(badge) = &self.badge {
             // Rozet, ilk kod satırından kopmasın diye onunla aynı birimde.
             let mut paragraph = Paragraph::default();
-            paragraph.push_styled(
-                badge.clone(),
+            self.push(
+                &mut paragraph,
+                badge,
                 self.style.with_font_size(7).with_color(self.palette.gutter),
             );
             planned.push(VisualLine {
@@ -1296,21 +1687,29 @@ impl CodeBlock {
                 let highlighted = self.marks.contains(&index);
                 // Vurgulu satırın numarası da öne çıksın: ikincil renk yerine
                 // kod metninin rengiyle basılır.
-                let marker_style = if highlighted { plain_style } else { gutter_style };
+                let marker_style = if highlighted {
+                    plain_style
+                } else {
+                    gutter_style
+                };
                 let marker = gutter_marker(index + 1, digits, part > 0, self.numbers);
                 // Numaralar kopyalanmasın diye glif sayısı saklanır; boş işaret
                 // (numara kapalı ve satır sarması yok) gizlenecek bir şey demek
                 // değildir.
                 let marker_glyphs = marker.chars().count();
                 if !marker.is_empty() {
-                    paragraph.push_styled(marker, marker_style);
+                    self.push(&mut paragraph, &marker, marker_style);
                 }
                 if chunk.is_empty() {
                     // Boş satır kısalmasın: yükseklik tek boşlukla korunur.
                     paragraph.push_styled(" ", plain_style);
                 }
                 for (text, kind) in runs(chunk) {
-                    paragraph.push_styled(text, token_style(self.style, kind, self.palette));
+                    self.push(
+                        &mut paragraph,
+                        &text,
+                        token_style(self.style, kind, self.palette),
+                    );
                 }
                 planned.push(VisualLine {
                     unit: index,
@@ -1346,8 +1745,8 @@ impl Element for CodeBlock {
 
         if self.planned.is_none() {
             let planned = self.plan(context, (box_width_mm - 2.0 * CODE_PADDING_MM).max(20.0));
-            let box_height_mm = planned.len() as f64 * self.line_height_mm(context)
-                + 2.0 * CODE_PADDING_MM;
+            let box_height_mm =
+                planned.len() as f64 * self.line_height_mm(context) + 2.0 * CODE_PADDING_MM;
             let fresh_page_mm = self.state.borrow().content_height_mm;
             self.planned = Some(planned);
             if should_move_to_next_page(box_height_mm, box_available_mm, fresh_page_mm) {
@@ -1439,7 +1838,11 @@ impl Element for CodeBlock {
             // çizilmemeli (bkz. `CodeBoxCapture`).
             size: Size::new(
                 box_width_mm as f32,
-                (if count == 0 { 0.0 } else { used_mm + 2.0 * CODE_PADDING_MM }) as f32,
+                (if count == 0 {
+                    0.0
+                } else {
+                    used_mm + 2.0 * CODE_PADDING_MM
+                }) as f32,
             ),
             has_more,
         })
@@ -1518,20 +1921,13 @@ fn gutter_marker(number: usize, digits: usize, continuation: bool, numbers: bool
     if continuation {
         format!("{} {GUTTER_SEPARATOR} {WRAP_MARKER} ", " ".repeat(digits))
     } else {
-        format!(
-            "{number:>width$} {GUTTER_SEPARATOR} ",
-            width = digits
-        )
+        format!("{number:>width$} {GUTTER_SEPARATOR} ", width = digits)
     }
 }
 
 /// Bir mantıksal satırı görsel satırlara böler: ilk parça `first` karakter,
 /// devamlar `rest` karakter taşır. Boş satır tek boş parçaya karşılık gelir.
-fn visual_chunks(
-    line: &[(char, Kind)],
-    first: usize,
-    rest: usize,
-) -> Vec<&[(char, Kind)]> {
+fn visual_chunks(line: &[(char, Kind)], first: usize, rest: usize) -> Vec<&[(char, Kind)]> {
     if line.is_empty() {
         return vec![line];
     }
@@ -1574,7 +1970,7 @@ fn token_style(base: Style, kind: Kind, palette: CodePalette) -> Style {
 }
 
 /// Liste bloğu dizisini iç içe listeye çevirir (hanging indent'li).
-fn nested_list(run: &[Block], body: Style) -> LinearLayout {
+fn nested_list(run: &[Block], body: Style, fonts: &Rc<FontPack>) -> LinearLayout {
     let items: Vec<ListItemData> = run
         .iter()
         .filter_map(|b| match b {
@@ -1593,7 +1989,7 @@ fn nested_list(run: &[Block], body: Style) -> LinearLayout {
     let mut pos = 0usize;
     let mut counters: Vec<usize> = Vec::new();
     let depth = items.first().map(|i| i.depth).unwrap_or(0);
-    build_list_level(&items, &mut pos, depth, &mut counters, body)
+    build_list_level(&items, &mut pos, depth, &mut counters, body, fonts)
 }
 
 struct ListItemData<'a> {
@@ -1608,7 +2004,9 @@ fn build_list_level(
     depth: u8,
     counters: &mut Vec<usize>,
     body: Style,
+    fonts: &Rc<FontPack>,
 ) -> LinearLayout {
+    let sans = &fonts.sans;
     let mut layout = LinearLayout::vertical();
     while *pos < items.len() && items[*pos].depth == depth {
         let item = &items[*pos];
@@ -1625,18 +2023,19 @@ fn build_list_level(
         };
 
         let mut body_layout = LinearLayout::vertical();
-        body_layout.push(Paragraph::new(item.text).styled(body));
+        body_layout.push(styled_paragraph(sans, item.text, body));
         *pos += 1;
         if *pos < items.len() && items[*pos].depth > depth {
             let child_depth = items[*pos].depth;
-            let sub = build_list_level(items, pos, child_depth, counters, body);
+            let sub = build_list_level(items, pos, child_depth, counters, body, fonts);
             body_layout.push(sub);
         }
 
         let mut point = BulletPoint::new(body_layout);
-        point.set_bullet(bullet);
         // Madde imi de bu stille basılır; renk verilmezse varsayılan siyah
         // kullanılır ve koyu/sepya temada görünmez olur.
+        // Madde imi yalnızca "•" veya sayı: her iki fontta da var.
+        point.set_bullet(bullet);
         layout.push(point.styled(body));
     }
     layout
@@ -1644,11 +2043,13 @@ fn build_list_level(
 
 /// Tabloyu çerçeveli bir ızgara olarak kurar. Çerçeve çizgileri tablonun
 /// stiline bağlıdır; koyu/sepya temada görünmesi için renk açıkça verilir.
-fn table_element(table: &Table, palette: Palette) -> Option<impl Element> {
+fn table_element(table: &Table, palette: Palette, font: &TextFont) -> Option<impl Element> {
     if table.columns == 0 {
         return None;
     }
-    let cell_style = Style::new().with_font_size(9).with_color(palette.text);
+    let cell_style = Style::from(font.family)
+        .with_font_size(9)
+        .with_color(palette.text);
     let header_style = cell_style.bold();
 
     let weights: Vec<usize> = (0..table.columns)
@@ -1663,14 +2064,18 @@ fn table_element(table: &Table, palette: Palette) -> Option<impl Element> {
             table
                 .header
                 .iter()
-                .map(|c| cell_element(c, header_style))
+                .map(|c| cell_element(c, header_style, font))
                 .collect(),
         );
     }
     for row in &table.rows {
-        let _ = layout.push_row(row.iter().map(|c| cell_element(c, cell_style)).collect());
+        let _ = layout.push_row(
+            row.iter()
+                .map(|c| cell_element(c, cell_style, font))
+                .collect(),
+        );
     }
-    Some(layout.styled(Style::new().with_color(palette.text)))
+    Some(layout.styled(Style::from(font.family).with_color(palette.text)))
 }
 
 /// Sütun ağırlığı: metni uzun olan sütun daha geniş yer alır (1..=3).
@@ -1696,19 +2101,15 @@ fn column_weight(table: &Table, column: usize) -> usize {
 
 /// Bir hücreyi elemana çevirir. Hücre satır sonu içeriyorsa satırlar ayrı
 /// paragraf olur (listeler hücre içinde madde madde kalır).
-fn cell_element(text: &str, style: Style) -> Box<dyn Element> {
+fn cell_element(text: &str, style: Style, font: &TextFont) -> Box<dyn Element> {
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     if lines.len() <= 1 {
         let single = lines.first().copied().unwrap_or("");
-        return Box::new(
-            Paragraph::new(single)
-                .styled(style)
-                .padded(Margins::trbl(1, 2, 1, 2)),
-        );
+        return Box::new(styled_paragraph(font, single, style).padded(Margins::trbl(1, 2, 1, 2)));
     }
     let mut layout = LinearLayout::vertical();
     for line in lines {
-        layout.push(Paragraph::new(line).styled(style));
+        layout.push(styled_paragraph(font, line, style));
     }
     Box::new(layout.padded(Margins::trbl(1, 2, 1, 2)))
 }
@@ -1733,13 +2134,82 @@ pub fn host(url: &str) -> String {
         .collect()
 }
 
-/// URL'den PDF dosya adı üretir (host tabanlı, güvenli karakterlere indirgenmiş).
+/// URL'den PDF dosya adı üretir: `host-yol-parçası.pdf`.
+///
+/// Yalnızca host kullanılsaydı aynı sitedeki farklı sayfalar aynı dosyaya
+/// yazardı (`doc.rust-lang.org/book/a.html` ve `.../b.html`); yolun son
+/// parçası adı ayırt eder.
 pub fn output_name(url: &str) -> String {
     let host = host(url);
     if host.is_empty() {
         return "sayfa.pdf".to_string();
     }
-    format!("{host}.pdf")
+    match path_slug(url) {
+        Some(slug) => format!("{host}-{slug}.pdf"),
+        None => format!("{host}.pdf"),
+    }
+}
+
+/// `%C3%87` gibi yüzde-kodlu baytları çözer (geçersiz diziler korunur).
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+            {
+                out.push(high * 16 + low);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Tek bir onaltılık basamağı çözer.
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// URL yolundan dosya adı için kısa, güvenli bir parça (`ch04-01-what-is-ownership`).
+///
+/// Kök adreslerde, yalnızca `index`/`default` gibi parçalarda ve uzantıda
+/// `None` döner; o hâlde dosya adı host olarak kalır.
+fn path_slug(url: &str) -> Option<String> {
+    const GENERIC: &[&str] = &["index", "default", "home", ""];
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let segment = parsed
+        .path_segments()?
+        .rev()
+        .find(|segment| !segment.is_empty())?;
+    // Yol parçaları yüzde-kodlu gelebilir; önce çözüp sonra sadeleştiriyoruz.
+    let decoded = percent_decode(segment);
+    let stem = decoded.split('.').next()?.to_ascii_lowercase();
+    let slug: String = stem
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let slug = slug.trim_matches('-').to_string();
+    if slug.is_empty() || GENERIC.contains(&slug.as_str()) {
+        return None;
+    }
+    Some(slug.chars().take(60).collect())
 }
 
 /// Belgeyi bellekteki PDF baytlarına dönüştürür (yer imleri atılır).
@@ -1757,15 +2227,46 @@ mod tests {
     use crate::extract::Block;
 
     #[test]
-    fn output_name_host_based() {
+    fn output_name_includes_a_path_slug() {
+        // Aynı host'taki farklı sayfalar aynı dosyaya yazılmamalı.
         assert_eq!(
-            output_name("https://developer.mozilla.org/x/y?a=b"),
+            output_name("https://doc.rust-lang.org/book/ch04-01-what-is-ownership.html"),
+            "doc.rust-lang.org-ch04-01-what-is-ownership.pdf"
+        );
+        assert_eq!(
+            output_name("https://doc.rust-lang.org/rust-by-example/hello.html"),
+            "doc.rust-lang.org-hello.pdf"
+        );
+        assert_ne!(
+            output_name("https://a.com/x.html"),
+            output_name("https://a.com/y.html")
+        );
+        // Kök ya da genel yol parçalarında yalnızca host kullanılır.
+        assert_eq!(
+            output_name("https://developer.mozilla.org/"),
             "developer.mozilla.org.pdf"
         );
-        assert_eq!(output_name("http://localhost:3000/a"), "localhost_3000.pdf");
-        assert_eq!(output_name("http://user:pass@host/p"), "user_pass_host.pdf");
+        assert_eq!(
+            output_name("https://developer.mozilla.org/index.html"),
+            "developer.mozilla.org.pdf"
+        );
+        assert_eq!(
+            output_name("http://localhost:3000/a"),
+            "localhost_3000-a.pdf"
+        );
+        assert_eq!(
+            output_name("http://user:pass@host/p"),
+            "user_pass_host-p.pdf"
+        );
         assert_eq!(output_name("not-a-url"), "not-a-url.pdf");
         assert_eq!(output_name(""), "sayfa.pdf");
+        // Yol parçası güvenli karakterlere indirgenir ve kısaltılır.
+        let long = output_name(&format!("https://a.com/{}", "x".repeat(200)));
+        assert!(long.len() <= 64 + "a.com-.pdf".len());
+        assert_eq!(
+            output_name("https://a.com/Çok%20Uzun%20Başlık.html"),
+            "a.com-ok-uzun-ba-l-k.pdf"
+        );
     }
 
     fn article() -> Article {
@@ -1886,13 +2387,25 @@ mod tests {
         assert_eq!(Theme::parse("neon"), None);
         assert_eq!(Theme::default(), Theme::Light);
         // Açık temada zemin çizilmez; koyu/sepya kendi zeminini ister.
-        assert!(Theme::Light.palette_with(CodeTheme::Auto).background.is_none());
-        assert!(Theme::Dark.palette_with(CodeTheme::Auto).background.is_some());
-        assert!(Theme::Sepia.palette_with(CodeTheme::Auto).background.is_some());
+        assert!(Theme::Light
+            .palette_with(CodeTheme::Auto)
+            .background
+            .is_none());
+        assert!(Theme::Dark
+            .palette_with(CodeTheme::Auto)
+            .background
+            .is_some());
+        assert!(Theme::Sepia
+            .palette_with(CodeTheme::Auto)
+            .background
+            .is_some());
         // Koyu temada metin açık, açık temada koyudur.
         let (dark_text, dark_bg) = (
             Theme::Dark.palette_with(CodeTheme::Auto).text,
-            Theme::Dark.palette_with(CodeTheme::Auto).background.unwrap(),
+            Theme::Dark
+                .palette_with(CodeTheme::Auto)
+                .background
+                .unwrap(),
         );
         assert_ne!(dark_text, dark_bg);
         let dark_luma = luma(dark_text);
@@ -1941,18 +2454,199 @@ mod tests {
 
     #[test]
     fn mono_family_is_embedded_only_when_code_exists() {
-        // Kod bloğu yoksa mono ailesi (4 font) hiç gömülmez.
-        let with_code =
-            render_to_bytes(build_document(&article(), &PdfOptions::default()).unwrap()).unwrap();
+        // Kod bloğu yoksa mono ailesi (ve mono yedeği) hiç gömülmez.
         let without: Article = Article {
             blocks: vec![Block::Paragraph("Paragraf metni ğüşıöç.".into())],
             ..article()
         };
-        let without_code =
+        let with_code = article();
+
+        let mut doc_with = Document::new(sans_family(&chars()).unwrap());
+        let pack_with = font_pack(&mut doc_with, &chars(), needs_mono(&with_code));
+        assert!(pack_with.mono.is_some(), "kod varsa mono aile kurulmalı");
+
+        let mut doc_without = Document::new(sans_family(&chars()).unwrap());
+        let pack_without = font_pack(&mut doc_without, &chars(), needs_mono(&without));
+        assert!(
+            pack_without.mono.is_none(),
+            "kod yoksa mono aile kurulmamalı"
+        );
+
+        let with_pdf =
+            render_to_bytes(build_document(&with_code, &PdfOptions::default()).unwrap()).unwrap();
+        let without_pdf =
             render_to_bytes(build_document(&without, &PdfOptions::default()).unwrap()).unwrap();
-        assert_eq!(embedded_fonts(&with_code), 8, "sans + mono aileleri");
-        assert_eq!(embedded_fonts(&without_code), 4, "yalnızca sans ailesi");
-        assert!(without_code.len() < with_code.len());
+        assert!(embedded_fonts(&with_pdf) > embedded_fonts(&without_pdf));
+        assert!(without_pdf.len() < with_pdf.len());
+    }
+
+    #[test]
+    fn fallback_font_is_embedded_only_for_characters_the_primary_font_lacks() {
+        // Sadece Türkçe metin: Liberation yeterli, yedek font gömülmemeli.
+        let turkish: BTreeSet<char> = "Merhaba ğüşıöçİĞÜŞÖÇ".chars().collect();
+        let mut doc = Document::new(sans_family(&turkish).unwrap());
+        let pack = font_pack(&mut doc, &turkish, false);
+        assert!(
+            pack.sans.fallback.is_none(),
+            "Türkçe karakterler için yedek font gereksiz"
+        );
+
+        // Onay işareti Liberation'da yok, DejaVu'da var: yedek aile devreye
+        // girmeli ve karakter "basılamayan" olarak raporlanmamalı.
+        let marks: BTreeSet<char> = "✓ ✗".chars().collect();
+        let mut doc = Document::new(sans_family(&marks).unwrap());
+        let pack = font_pack(&mut doc, &marks, false);
+        assert!(pack.sans.fallback.is_some(), "✓ için yedek gerekli");
+        assert!(
+            pack.sans.missing().is_empty(),
+            "yazı tipinde karşılığı olmalı"
+        );
+
+        // CJK hiçbir gömülü fontta yok: kullanıcıya raporlanmalı.
+        let cjk: BTreeSet<char> = "字".chars().collect();
+        let mut doc = Document::new(sans_family(&cjk).unwrap());
+        let pack = font_pack(&mut doc, &cjk, false);
+        assert!(pack.sans.missing().contains(&'字'));
+    }
+
+    #[test]
+    fn report_flags_characters_that_no_embedded_font_can_print() {
+        let art = Article {
+            blocks: vec![Block::Paragraph("Kontrol: 字 ✓ 😀".into())],
+            ..article()
+        };
+        let rendered =
+            crate::pdf::render_article(&art, &PdfOptions::default(), &Default::default()).unwrap();
+        assert!(
+            rendered.missing_glyphs.contains(&'字'),
+            "fontlarda karşılığı olmayan karakter raporlanmalı"
+        );
+        // Yedek fontla basılabilen karakterler raporlanmaz (emoji ve onay
+        // işareti format 12 ile gömülüyor).
+        for printable in ['✓', '😀'] {
+            assert!(
+                !rendered.missing_glyphs.contains(&printable),
+                "{printable} yedek fontla basılabiliyor"
+            );
+        }
+    }
+
+    #[test]
+    fn heading_placed_only_after_something_was_printed() {
+        // Tam sığan başlık: yer imi kaydedilir.
+        assert!(heading_placed(&RenderResult {
+            size: Size::new(10.0, 8.0),
+            has_more: false,
+        }));
+        // Sayfayı taşan başlık: ilk satır burada basıldı, kaydedilir.
+        assert!(heading_placed(&RenderResult {
+            size: Size::new(10.0, 8.0),
+            has_more: true,
+        }));
+        // Hiç satır sığmayan başlık: henüz basılmadı, kaydedilmez.
+        assert!(!heading_placed(&RenderResult {
+            size: Size::new(10.0, 0.0),
+            has_more: true,
+        }));
+        // Boş paragraf `has_more` vermez; kaydedilmiş sayılır.
+        assert!(heading_placed(&RenderResult::default()));
+    }
+
+    #[test]
+    fn a_heading_spanning_pages_is_bookmarked_on_its_first_page() {
+        // Uzun başlık iki sayfaya taşar; yer imi başladığı sayfayı göstermeli.
+        let long = "Başlık ".repeat(120);
+        let art = Article {
+            blocks: vec![Block::Heading {
+                level: 2,
+                text: long,
+            }],
+            ..article()
+        };
+        let (_, bookmarks) = build_document(&art, &PdfOptions::default())
+            .unwrap()
+            .render_with_bookmarks()
+            .unwrap();
+        let heading = bookmarks
+            .iter()
+            .find(|b| b.title.starts_with("Başlık"))
+            .expect("başlık yer imi olmalı");
+        assert_eq!(heading.page, 1, "yer imi başlığın ilk sayfasını göstermeli");
+    }
+
+    #[test]
+    fn bookmarks_follow_document_order_across_pages() {
+        let mut art = Article {
+            blocks: Vec::new(),
+            ..article()
+        };
+        for chapter in 0..6 {
+            art.blocks.push(Block::Heading {
+                level: 2,
+                text: format!("Bölüm {chapter}"),
+            });
+            for _ in 0..12 {
+                art.blocks.push(Block::Paragraph(
+                    "Sayfa geçişini zorlayan uzun bir paragraf metni. Lorem ipsum dolor sit amet."
+                        .to_string(),
+                ));
+            }
+        }
+        let bytes = render_to_bytes(build_document(&art, &PdfOptions::default()).unwrap()).unwrap();
+        let pages = lopdf::Document::load_mem(&bytes)
+            .map(|doc| doc.get_pages().len())
+            .unwrap_or(1);
+        let (_, bookmarks) = build_document(&art, &PdfOptions::default())
+            .unwrap()
+            .render_with_bookmarks()
+            .unwrap();
+        let chapters: Vec<&Bookmark> = bookmarks
+            .iter()
+            .filter(|b| b.title.starts_with("Bölüm"))
+            .collect();
+        assert_eq!(chapters.len(), 6);
+        // Yer imleri belge sırasında ilerlemeli ve var olan sayfalara
+        // işaret etmeli (içindekiler panelindeki tıklama hep doğru yere
+        // götürür).
+        let mut previous = 0;
+        for bookmark in chapters {
+            assert!(
+                bookmark.page >= previous,
+                "{} sayfa {} geride",
+                bookmark.title,
+                previous
+            );
+            assert!(
+                bookmark.page as usize <= pages,
+                "{} sayfa {} mevcut değil ({} sayfa)",
+                bookmark.title,
+                bookmark.page,
+                pages
+            );
+            previous = bookmark.page;
+        }
+    }
+
+    #[test]
+    fn split_by_coverage_moves_only_uncovered_characters_to_the_fallback() {
+        let primary: BTreeSet<char> = "ab".chars().collect();
+        let fallback: BTreeSet<char> = "├".chars().collect();
+        let parts = split_by_coverage("ab├cd", &primary, &fallback);
+        assert_eq!(
+            parts,
+            vec![
+                ("ab".to_string(), false),
+                ("├".to_string(), true),
+                // `cd` yedek fontta yok: ana fontta kalır (boş kutu olur).
+                ("cd".to_string(), false),
+            ]
+        );
+        // Boşluklar komşu parçaya yapışır.
+        let parts = split_by_coverage("a ├", &primary, &fallback);
+        assert_eq!(
+            parts,
+            vec![("a ".to_string(), false), ("├".to_string(), true)]
+        );
     }
 
     #[test]
@@ -2016,13 +2710,26 @@ mod tests {
         assert!(b2.len() > b1.len());
     }
 
+    /// Testler için yazı tipi paketi kurar (belgeye kayıt gerektirir).
+    fn font_pack(doc: &mut Document, chars: &BTreeSet<char>, mono: bool) -> Rc<FontPack> {
+        Rc::new(install_fonts(doc, chars, mono).expect("yazı tipleri kurulmalı"))
+    }
+
+    /// Belgeye kayıtlı sans yazı tipi (yardımcı elemanlarda kullanılır).
+    fn sans_font(doc: &mut Document, chars: &BTreeSet<char>) -> Rc<TextFont> {
+        let pack = font_pack(doc, chars, false);
+        Rc::clone(&pack.sans)
+    }
+
     #[test]
     fn header_layout_renders_page_number_and_hides_title_on_first_page() {
         let palette = Theme::Light.palette_with(CodeTheme::Auto);
-        let mut layout = header_layout("Deneme".to_string(), palette, false)(3);
+        let mut doc = Document::new(sans_family(&chars()).unwrap());
+        let font = sans_font(&mut doc, &chars());
+        let mut layout = header_layout("Deneme".to_string(), palette, false, &font)(3);
         let _ = &mut layout;
         // İlk sayfada başlık tekrarını önlemek için boş bırakılır.
-        let _ = header_layout("Deneme".to_string(), palette, false)(1);
+        let _ = header_layout("Deneme".to_string(), palette, false, &font)(1);
     }
 
     #[test]
@@ -2066,7 +2773,14 @@ mod tests {
 
     #[test]
     fn empty_table_is_skipped() {
-        assert!(table_element(&Table::default(), Theme::Light.palette_with(CodeTheme::Auto)).is_none());
+        let mut doc = Document::new(sans_family(&chars()).unwrap());
+        let font = sans_font(&mut doc, &chars());
+        assert!(table_element(
+            &Table::default(),
+            Theme::Light.palette_with(CodeTheme::Auto),
+            &font
+        )
+        .is_none());
     }
 
     #[test]
@@ -2137,6 +2851,8 @@ mod tests {
     fn code_block_renders_with_numbers_and_badge() {
         let style = Style::new().with_font_size(9);
         let state = Rc::new(RefCell::new(CaptureState::default()));
+        let mut fonts_doc = Document::new(sans_family(&chars()).unwrap());
+        let fonts = font_pack(&mut fonts_doc, &chars(), true);
         let el = code_block(
             "fn main() {\n    let x = 1;\n\n    println!(\"{x}\");\n}",
             Some("rust"),
@@ -2149,6 +2865,7 @@ mod tests {
                 line_highlights: true,
             },
             &state,
+            &fonts,
         );
         let mut doc = Document::new(sans_family(&chars()).unwrap());
         doc.push(el);
@@ -2236,10 +2953,7 @@ mod tests {
 
     #[test]
     fn visual_chunks_splits_first_and_continuation_lines() {
-        let line: Vec<(char, Kind)> = "abcdefghij"
-            .chars()
-            .map(|ch| (ch, Kind::Plain))
-            .collect();
+        let line: Vec<(char, Kind)> = "abcdefghij".chars().map(|ch| (ch, Kind::Plain)).collect();
         let chunks = visual_chunks(&line, 4, 3);
         let sizes: Vec<usize> = chunks.iter().map(|c| c.len()).collect();
         assert_eq!(sizes, vec![4, 3, 3]);
@@ -2247,7 +2961,10 @@ mod tests {
         assert_eq!(visual_chunks(&[], 4, 3).len(), 1);
         assert!(visual_chunks(&[], 4, 3)[0].is_empty());
         // Parçalar satırı birebir kaplar.
-        let rebuilt: String = chunks.iter().flat_map(|c| c.iter().map(|(ch, _)| *ch)).collect();
+        let rebuilt: String = chunks
+            .iter()
+            .flat_map(|c| c.iter().map(|(ch, _)| *ch))
+            .collect();
         assert_eq!(rebuilt, "abcdefghij");
     }
 
@@ -2301,7 +3018,10 @@ mod tests {
         }
         assert_eq!(CodeTheme::parse(" MONOKAI "), Some(CodeTheme::Monokai));
         assert_eq!(CodeTheme::parse("github"), Some(CodeTheme::GithubLight));
-        assert_eq!(CodeTheme::parse("solarized"), Some(CodeTheme::SolarizedLight));
+        assert_eq!(
+            CodeTheme::parse("solarized"),
+            Some(CodeTheme::SolarizedLight)
+        );
         assert_eq!(CodeTheme::parse("neon"), None);
 
         // `auto` sayfa temasına uyar.
@@ -2442,7 +3162,13 @@ mod tests {
         let palette = Theme::Light.palette_with(CodeTheme::Auto);
         let rendered = |continues: bool| {
             let mut doc = Document::new(sans_family(&chars()).unwrap());
-            doc.push(header_layout("Başlık".to_string(), palette, continues)(3));
+            let font = sans_font(&mut doc, &chars());
+            doc.push(header_layout(
+                "Başlık".to_string(),
+                palette,
+                continues,
+                &font,
+            )(3));
             let mut bytes = Vec::new();
             doc.render(&mut bytes).unwrap();
             text_operations(&bytes)
@@ -2487,7 +3213,10 @@ mod tests {
     }
 
     /// Vurgulu satırlarla kurulmuş tek kod bloğundan (kutu, bantlar) çifti.
-    fn highlight_rects(highlights: Vec<usize>, opts: &PdfOptions) -> (Vec<CodeBoxRect>, Vec<CodeBoxRect>) {
+    fn highlight_rects(
+        highlights: Vec<usize>,
+        opts: &PdfOptions,
+    ) -> (Vec<CodeBoxRect>, Vec<CodeBoxRect>) {
         let art = Article {
             title: "Vurgu".into(),
             blocks: vec![Block::Code {
@@ -2514,7 +3243,10 @@ mod tests {
         // Bant, kutunun iç dolgusundan sonra başlar; sol şeride ve çerçeveye
         // değmez, satır numarası sütununu da kapsar.
         assert_eq!(bant.page, kutu.page);
-        assert!((bant.x_mm - (kutu.x_mm + CODE_PADDING_MM)).abs() < 0.01, "{bant:?}");
+        assert!(
+            (bant.x_mm - (kutu.x_mm + CODE_PADDING_MM)).abs() < 0.01,
+            "{bant:?}"
+        );
         assert!(
             (bant.width_mm - (kutu.width_mm - 2.0 * CODE_PADDING_MM)).abs() < 0.01,
             "{bant:?}"
@@ -2566,12 +3298,12 @@ mod tests {
 
     #[test]
     fn no_images_option_skips_image_blocks_silently() {
-        // Görsel yükleme global sayaç/önbellek kullanır: diğer görsel
-        // testleriyle yarışmamak için paylaşılan kilidi alıyoruz.
-        let _guard = crate::images::test_lock();
         let art = Article {
             blocks: vec![
-                Block::Image("https://example.invalid/a.png".into()),
+                Block::Image {
+                    url: "https://example.invalid/a.png".into(),
+                    alt: "örnek görsel".into(),
+                },
                 Block::Paragraph("metin".into()),
             ],
             ..article()
@@ -2585,7 +3317,10 @@ mod tests {
         // "yüklenemedi" notu basılmamalı: ham akışta aramak yerine, notu
         // üreten kod yolunun atlandığını dolaylı olarak doğruluyoruz.
         let with_note = Article {
-            blocks: vec![Block::Image("https://example.invalid/a.png".into())],
+            blocks: vec![Block::Image {
+                url: "https://example.invalid/a.png".into(),
+                alt: String::new(),
+            }],
             ..article()
         };
         let bytes_note =

@@ -197,13 +197,7 @@ fn classify(spec: &Spec, word: &str, after: &str) -> Kind {
         // Python/Java dekoratörleri, PHP değişkenleri.
         return Kind::Type;
     }
-    if spec.capital_types
-        && word
-            .chars()
-            .next()
-            .map(char::is_uppercase)
-            .unwrap_or(false)
-    {
+    if spec.capital_types && word.chars().next().map(char::is_uppercase).unwrap_or(false) {
         return Kind::Type;
     }
     let rest = after.trim_start_matches([' ', '\t']);
@@ -219,9 +213,7 @@ fn classify(spec: &Spec, word: &str, after: &str) -> Kind {
 /// Anahtar sözcük karşılaştırması (dil gerekirse harf duyarsız).
 fn is_keyword(spec: &Spec, word: &str) -> bool {
     if spec.case_insensitive {
-        spec.keywords
-            .iter()
-            .any(|kw| kw.eq_ignore_ascii_case(word))
+        spec.keywords.iter().any(|kw| kw.eq_ignore_ascii_case(word))
     } else {
         spec.keywords.contains(&word)
     }
@@ -230,7 +222,8 @@ fn is_keyword(spec: &Spec, word: &str) -> bool {
 /// Sayının uzunluğu: `0x1F`, `1_000`, `3.14`, `1e-9`, `2.5f64`.
 fn scan_number(s: &str) -> usize {
     let b = s.as_bytes();
-    let hex = b.len() > 1 && b[0] == b'0' && matches!(b[1], b'x' | b'X' | b'b' | b'B' | b'o' | b'O');
+    let hex =
+        b.len() > 1 && b[0] == b'0' && matches!(b[1], b'x' | b'X' | b'b' | b'B' | b'o' | b'O');
     let mut i = if hex { 2 } else { 0 };
     let mut fractional = false;
 
@@ -618,14 +611,12 @@ pub fn normalize_lang(lang: &str) -> String {
     }
 }
 
-
 const RUST_KW: &[&str] = &[
-    "as", "async", "await", "bool", "break", "char", "const", "continue", "crate", "dyn",
-    "else", "enum", "extern", "f32", "f64", "false", "fn", "for", "i128", "i16", "i32", "i64",
-    "i8", "if", "impl", "in", "isize", "let", "loop", "match", "mod", "move", "mut", "pub",
-    "ref", "return", "self", "Self", "static", "str", "struct", "super", "trait", "true",
-    "type", "u128", "u16", "u32", "u64", "u8", "unsafe", "use", "usize", "where", "while",
-    "yield",
+    "as", "async", "await", "bool", "break", "char", "const", "continue", "crate", "dyn", "else",
+    "enum", "extern", "f32", "f64", "false", "fn", "for", "i128", "i16", "i32", "i64", "i8", "if",
+    "impl", "in", "isize", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return",
+    "self", "Self", "static", "str", "struct", "super", "trait", "true", "type", "u128", "u16",
+    "u32", "u64", "u8", "unsafe", "use", "usize", "where", "while", "yield",
 ];
 
 const PYTHON_KW: &[&str] = &[
@@ -636,31 +627,184 @@ const PYTHON_KW: &[&str] = &[
 ];
 
 const JS_KW: &[&str] = &[
-    "async", "await", "break", "case", "catch", "class", "const", "continue", "debugger",
-    "default", "delete", "do", "else", "export", "extends", "finally", "for", "from", "function",
-    "get", "if", "implements", "import", "in", "instanceof", "interface", "let", "new", "null",
-    "of", "private", "protected", "public", "readonly", "return", "set", "static", "super",
-    "switch", "this", "throw", "try", "type", "typeof", "undefined", "var", "void", "while",
-    "yield", "true", "false",
+    "async",
+    "await",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "debugger",
+    "default",
+    "delete",
+    "do",
+    "else",
+    "export",
+    "extends",
+    "finally",
+    "for",
+    "from",
+    "function",
+    "get",
+    "if",
+    "implements",
+    "import",
+    "in",
+    "instanceof",
+    "interface",
+    "let",
+    "new",
+    "null",
+    "of",
+    "private",
+    "protected",
+    "public",
+    "readonly",
+    "return",
+    "set",
+    "static",
+    "super",
+    "switch",
+    "this",
+    "throw",
+    "try",
+    "type",
+    "typeof",
+    "undefined",
+    "var",
+    "void",
+    "while",
+    "yield",
+    "true",
+    "false",
 ];
 
 const GO_KW: &[&str] = &[
-    "break", "case", "chan", "const", "continue", "default", "defer", "else", "fallthrough",
-    "for", "func", "go", "goto", "if", "import", "interface", "map", "package", "range", "return",
-    "select", "struct", "switch", "type", "var", "nil", "true", "false",
+    "break",
+    "case",
+    "chan",
+    "const",
+    "continue",
+    "default",
+    "defer",
+    "else",
+    "fallthrough",
+    "for",
+    "func",
+    "go",
+    "goto",
+    "if",
+    "import",
+    "interface",
+    "map",
+    "package",
+    "range",
+    "return",
+    "select",
+    "struct",
+    "switch",
+    "type",
+    "var",
+    "nil",
+    "true",
+    "false",
 ];
 
 const CLIKE_KW: &[&str] = &[
-    "abstract", "as", "assert", "auto", "bool", "break", "case", "catch", "char", "class",
-    "const", "continue", "data", "default", "defer", "delete", "do", "double", "else", "enum",
-    "extends", "extern", "false", "final", "finally", "float", "fn", "for", "fun", "func",
-    "guard", "if", "implements", "import", "in", "inline", "instanceof", "int", "interface",
-    "internal", "is", "lambda", "let", "long", "map", "namespace", "new", "nil", "null",
-    "nullptr", "object", "operator", "override", "package", "private", "protected", "protocol",
-    "public", "readonly", "register", "repeat", "return", "sealed", "short", "signed", "sizeof",
-    "static", "struct", "super", "switch", "template", "this", "throw", "throws", "trait", "true",
-    "try", "typealias", "typedef", "typename", "union", "unsafe", "unsigned", "val", "var",
-    "virtual", "void", "volatile", "when", "where", "while", "with", "yield",
+    "abstract",
+    "as",
+    "assert",
+    "auto",
+    "bool",
+    "break",
+    "case",
+    "catch",
+    "char",
+    "class",
+    "const",
+    "continue",
+    "data",
+    "default",
+    "defer",
+    "delete",
+    "do",
+    "double",
+    "else",
+    "enum",
+    "extends",
+    "extern",
+    "false",
+    "final",
+    "finally",
+    "float",
+    "fn",
+    "for",
+    "fun",
+    "func",
+    "guard",
+    "if",
+    "implements",
+    "import",
+    "in",
+    "inline",
+    "instanceof",
+    "int",
+    "interface",
+    "internal",
+    "is",
+    "lambda",
+    "let",
+    "long",
+    "map",
+    "namespace",
+    "new",
+    "nil",
+    "null",
+    "nullptr",
+    "object",
+    "operator",
+    "override",
+    "package",
+    "private",
+    "protected",
+    "protocol",
+    "public",
+    "readonly",
+    "register",
+    "repeat",
+    "return",
+    "sealed",
+    "short",
+    "signed",
+    "sizeof",
+    "static",
+    "struct",
+    "super",
+    "switch",
+    "template",
+    "this",
+    "throw",
+    "throws",
+    "trait",
+    "true",
+    "try",
+    "typealias",
+    "typedef",
+    "typename",
+    "union",
+    "unsafe",
+    "unsigned",
+    "val",
+    "var",
+    "virtual",
+    "void",
+    "volatile",
+    "when",
+    "where",
+    "while",
+    "with",
+    "yield",
 ];
 
 const SHELL_KW: &[&str] = &[
@@ -670,14 +814,82 @@ const SHELL_KW: &[&str] = &[
 ];
 
 const SQL_KW: &[&str] = &[
-    "add", "all", "alter", "and", "any", "as", "asc", "avg", "begin", "between", "by", "case",
-    "cast", "check", "column", "commit", "constraint", "count", "create", "cross", "current",
-    "database", "default", "delete", "desc", "distinct", "drop", "else", "end", "except",
-    "exists", "false", "foreign", "from", "full", "group", "having", "if", "in", "index", "inner",
-    "insert", "into", "is", "join", "key", "left", "like", "limit", "max", "min", "not", "null",
-    "offset", "on", "or", "order", "outer", "primary", "references", "right", "rollback", "select",
-    "set", "sum", "table", "then", "true", "union", "unique", "update", "values", "view", "when",
-    "where", "with",
+    "add",
+    "all",
+    "alter",
+    "and",
+    "any",
+    "as",
+    "asc",
+    "avg",
+    "begin",
+    "between",
+    "by",
+    "case",
+    "cast",
+    "check",
+    "column",
+    "commit",
+    "constraint",
+    "count",
+    "create",
+    "cross",
+    "current",
+    "database",
+    "default",
+    "delete",
+    "desc",
+    "distinct",
+    "drop",
+    "else",
+    "end",
+    "except",
+    "exists",
+    "false",
+    "foreign",
+    "from",
+    "full",
+    "group",
+    "having",
+    "if",
+    "in",
+    "index",
+    "inner",
+    "insert",
+    "into",
+    "is",
+    "join",
+    "key",
+    "left",
+    "like",
+    "limit",
+    "max",
+    "min",
+    "not",
+    "null",
+    "offset",
+    "on",
+    "or",
+    "order",
+    "outer",
+    "primary",
+    "references",
+    "right",
+    "rollback",
+    "select",
+    "set",
+    "sum",
+    "table",
+    "then",
+    "true",
+    "union",
+    "unique",
+    "update",
+    "values",
+    "view",
+    "when",
+    "where",
+    "with",
 ];
 
 const RUBY_KW: &[&str] = &[
@@ -688,26 +900,143 @@ const RUBY_KW: &[&str] = &[
 ];
 
 const PHP_KW: &[&str] = &[
-    "abstract", "and", "array", "as", "break", "case", "catch", "class", "clone", "const",
-    "continue", "declare", "default", "do", "echo", "else", "elseif", "enddeclare", "endfor",
-    "endforeach", "endif", "endswitch", "endwhile", "extends", "final", "finally", "fn", "for",
-    "foreach", "function", "global", "if", "implements", "include", "instanceof", "interface",
-    "isset", "list", "match", "namespace", "new", "or", "print", "private", "protected", "public",
-    "readonly", "require", "return", "static", "switch", "throw", "trait", "try", "unset", "use",
-    "var", "while", "xor", "yield", "true", "false", "null",
+    "abstract",
+    "and",
+    "array",
+    "as",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "clone",
+    "const",
+    "continue",
+    "declare",
+    "default",
+    "do",
+    "echo",
+    "else",
+    "elseif",
+    "enddeclare",
+    "endfor",
+    "endforeach",
+    "endif",
+    "endswitch",
+    "endwhile",
+    "extends",
+    "final",
+    "finally",
+    "fn",
+    "for",
+    "foreach",
+    "function",
+    "global",
+    "if",
+    "implements",
+    "include",
+    "instanceof",
+    "interface",
+    "isset",
+    "list",
+    "match",
+    "namespace",
+    "new",
+    "or",
+    "print",
+    "private",
+    "protected",
+    "public",
+    "readonly",
+    "require",
+    "return",
+    "static",
+    "switch",
+    "throw",
+    "trait",
+    "try",
+    "unset",
+    "use",
+    "var",
+    "while",
+    "xor",
+    "yield",
+    "true",
+    "false",
+    "null",
 ];
 
-const DATA_KW: &[&str] = &["true", "false", "null", "none", "True", "False", "None", "yes", "no"];
+const DATA_KW: &[&str] = &[
+    "true", "false", "null", "none", "True", "False", "None", "yes", "no",
+];
 
 const GENERIC_KW: &[&str] = &[
-    "and", "as", "async", "await", "break", "case", "class", "const", "continue", "def",
-    "default", "do", "else", "elseif", "end", "enum", "except", "export", "extends", "false",
-    "finally", "fn", "for", "from", "func", "function", "if", "impl", "import", "in",
+    "and",
+    "as",
+    "async",
+    "await",
+    "break",
+    "case",
+    "class",
+    "const",
+    "continue",
+    "def",
+    "default",
+    "do",
+    "else",
+    "elseif",
+    "end",
+    "enum",
+    "except",
+    "export",
+    "extends",
+    "false",
+    "finally",
+    "fn",
+    "for",
+    "from",
+    "func",
+    "function",
+    "if",
+    "impl",
+    "import",
+    "in",
     "interface",
-    "let", "match", "new", "nil", "none", "not", "null", "of", "or", "package", "pass", "private",
-    "protected", "pub", "public", "raise", "return", "self", "static", "struct", "switch", "then",
-    "this", "throw", "trait", "true", "try", "type", "use", "var", "void", "when", "where",
-    "while", "with", "yield",
+    "let",
+    "match",
+    "new",
+    "nil",
+    "none",
+    "not",
+    "null",
+    "of",
+    "or",
+    "package",
+    "pass",
+    "private",
+    "protected",
+    "pub",
+    "public",
+    "raise",
+    "return",
+    "self",
+    "static",
+    "struct",
+    "switch",
+    "then",
+    "this",
+    "throw",
+    "trait",
+    "true",
+    "try",
+    "type",
+    "use",
+    "var",
+    "void",
+    "when",
+    "where",
+    "while",
+    "with",
+    "yield",
 ];
 
 // ---------------------------------------------------------------------- tests
@@ -790,7 +1119,10 @@ mod tests {
         assert_eq!(kind_of(code, Some("python"), "# yorum"), Kind::Comment);
         assert_eq!(kind_of(code, Some("python"), "def"), Kind::Keyword);
         // Üçlü dize iki satıra yayılır: girinti düz, kalanı dize renginde.
-        assert_eq!(kinds_of(code, Some("python"), 2), vec![Kind::Plain, Kind::Str]);
+        assert_eq!(
+            kinds_of(code, Some("python"), 2),
+            vec![Kind::Plain, Kind::Str]
+        );
         assert_eq!(kinds_of(code, Some("python"), 3), vec![Kind::Str]);
         // `return` anahtar sözcük, ardından gelen `1` sayı.
         assert_eq!(kind_of(code, Some("python"), "1"), Kind::Number);
@@ -813,10 +1145,19 @@ mod tests {
 
     #[test]
     fn sql_keywords_are_case_insensitive() {
-        assert_eq!(kind_of("SELECT a FROM t", Some("sql"), "SELECT"), Kind::Keyword);
-        assert_eq!(kind_of("select a from t", Some("sql"), "from"), Kind::Keyword);
+        assert_eq!(
+            kind_of("SELECT a FROM t", Some("sql"), "SELECT"),
+            Kind::Keyword
+        );
+        assert_eq!(
+            kind_of("select a from t", Some("sql"), "from"),
+            Kind::Keyword
+        );
         // Rust'ta `select` anahtar sözcük değil.
-        assert_eq!(kind_of("select a from t", Some("rust"), "select"), Kind::Plain);
+        assert_eq!(
+            kind_of("select a from t", Some("rust"), "select"),
+            Kind::Plain
+        );
     }
 
     #[test]
@@ -833,12 +1174,21 @@ mod tests {
     #[test]
     fn number_scanner_handles_common_forms() {
         assert_eq!(kind_of("x = 0xFF", Some("rust"), "0xFF"), Kind::Number);
-        assert_eq!(kind_of("x = 1_000_000", Some("rust"), "1_000_000"), Kind::Number);
+        assert_eq!(
+            kind_of("x = 1_000_000", Some("rust"), "1_000_000"),
+            Kind::Number
+        );
         assert_eq!(kind_of("x = 1.5e-3", Some("rust"), "1.5e-3"), Kind::Number);
         assert_eq!(kind_of("x = 42u8", Some("rust"), "42u8"), Kind::Number);
         // Aralık operatörü sayıya yapışmaz.
-        assert_eq!(kind_of("for i in 0..10 {}", Some("rust"), "0"), Kind::Number);
-        assert_eq!(rebuilt("for i in 0..10 {}", Some("rust")), "for i in 0..10 {}");
+        assert_eq!(
+            kind_of("for i in 0..10 {}", Some("rust"), "0"),
+            Kind::Number
+        );
+        assert_eq!(
+            rebuilt("for i in 0..10 {}", Some("rust")),
+            "for i in 0..10 {}"
+        );
     }
 
     #[test]
